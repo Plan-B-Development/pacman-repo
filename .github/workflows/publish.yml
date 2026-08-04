@@ -176,6 +176,20 @@ jobs:
             ./*.pkg.tar.zst ./*.pkg.tar.zst.sig \
             control-ofc.gpg
 
+          # Prune superseded assets. `--clobber` only overwrites assets of the
+          # SAME name, so without this every past version accumulates on the
+          # release forever. They are inert (the database only ever references
+          # the current set) but the release grows without bound and reads as
+          # though several versions are on offer.
+          ls -1 > /tmp/keep.txt
+          gh release view "$REPO_TAG" --json assets -q '.assets[].name' \
+            | while read -r asset; do
+                if ! grep -qxF "$asset" /tmp/keep.txt; then
+                  echo "pruning superseded asset: $asset"
+                  gh release delete-asset "$REPO_TAG" "$asset" --yes
+                fi
+              done
+
           echo "### Published" >> "$GITHUB_STEP_SUMMARY"
           for pkg in *.pkg.tar.zst; do
             echo "- \`$pkg\`" >> "$GITHUB_STEP_SUMMARY"

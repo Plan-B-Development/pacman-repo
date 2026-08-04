@@ -98,6 +98,34 @@ jobs:
           grep -q 'control-ofc-daemon' /tmp/plan.txt \
             || { echo "::error::control-ofc-gui did not pull in control-ofc-daemon"; exit 1; }
 
+      # Staleness alarm. Everything above passes just as happily against a
+      # repository frozen ten versions ago — an install that works is not an
+      # install that is current. This is the check that catches a publish that
+      # never ran: a failed `notify-repo`, an expired PACMAN_REPO_TOKEN, or a
+      # dispatch that was silently dropped. On the daily schedule it is the only
+      # thing standing between a broken notify and users quietly stopping at an
+      # old version.
+      - name: Repository is not stale
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed github-cli
+          stale=0
+          for pkg in control-ofc-daemon control-ofc-gui; do
+            upstream=$(gh release view --repo "Plan-B-Development/$pkg" \
+                         --json tagName -q '.tagName' | sed 's/^v//')
+            served=$(pacman -Si "control-ofc/$pkg" \
+                       | awk '/^Version/ {print $3}' | sed 's/-[0-9]*$//')
+            if [ "$upstream" != "$served" ]; then
+              echo "::error::${pkg}: repository serves ${served} but the latest release is ${upstream}. The publish workflow has not run for this release — check notify-repo in the source repo and the PACMAN_REPO_TOKEN secret."
+              stale=1
+            else
+              echo "ok: ${pkg} ${served} matches the latest release"
+            fi
+          done
+          exit "$stale"
+
       - name: Summary
         run: |
           {
@@ -105,4 +133,5 @@ jobs:
             echo "- key trusted from raw.githubusercontent"
             echo "- database signature verified (SigLevel = Required)"
             echo "- both packages downloaded and signature-checked"
+            echo "- served versions match the latest upstream releases"
           } >> "$GITHUB_STEP_SUMMARY"
