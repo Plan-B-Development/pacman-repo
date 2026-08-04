@@ -1,0 +1,108 @@
+name: Verify install path
+
+# Proves the published repository actually works, from a clean machine, using
+# exactly the commands README.md gives users. Nothing else in this project tests
+# the thing users actually do — a broken database, an unsigned package, a
+# symlinked .db, or an untrusted key all produce a perfectly green publish run
+# and a repository nobody can install from.
+#
+# Runs after every publish, and on a daily schedule. The schedule matters: this
+# repository can break without anyone touching it (an expired signing key, a
+# deleted release asset, a GitHub storage change), and the failure would
+# otherwise first surface as a user's `pacman -Syu` breaking.
+
+on:
+  workflow_run:
+    workflows: [Publish pacman repository]
+    types: [completed]
+  workflow_dispatch:
+  schedule:
+    # 07:00 UTC daily.
+    - cron: '0 7 * * *'
+
+permissions:
+  contents: read
+
+env:
+  SIGNING_KEY: 4AAD6D2DE40D0D10773BF770BC27C5EB2831FCDA
+
+jobs:
+  verify:
+    name: Clean-machine install
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    # Do not chase a publish that already failed.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Prepare a clean pacman keyring
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed curl
+          pacman-key --init
+          pacman-key --populate archlinux
+
+      # Deliberately fetched over raw.githubusercontent, exactly as README.md
+      # tells users to — so this step fails if that URL ever stops serving the
+      # key, which is a documented install step breaking.
+      - name: Trust the repository signing key
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/keys/control-ofc.gpg" \
+            | pacman-key --add -
+          pacman-key --lsign-key "$SIGNING_KEY"
+
+      - name: Add the repository
+        run: |
+          set -euo pipefail
+          cat >> /etc/pacman.conf <<EOF
+
+          [control-ofc]
+          SigLevel = Required
+          Server = https://github.com/${GITHUB_REPOSITORY}/releases/download/repo
+          EOF
+          tail -5 /etc/pacman.conf
+
+      # `-Sy` against only this repo: it must serve a database that parses AND
+      # whose signature verifies against the key trusted above. SigLevel=Required
+      # makes an unsigned or wrongly-signed DB a hard failure here.
+      - name: Sync the database
+        run: pacman -Sy --noconfirm
+
+      - name: Both packages are visible and resolvable
+        run: |
+          set -euo pipefail
+          pacman -Sl control-ofc
+          for pkg in control-ofc-daemon control-ofc-gui; do
+            pacman -Si "control-ofc/$pkg" > /dev/null
+            echo "ok: $pkg is in the repository"
+          done
+
+      # The real test: download and signature-check the packages. This exercises
+      # the per-package `.sig` sibling fetch, which is the part that silently
+      # fails if a package was uploaded without its signature.
+      - name: Download and verify the packages
+        run: |
+          set -euo pipefail
+          pacman -Sw --noconfirm control-ofc-gui
+          ls -l /var/cache/pacman/pkg/
+
+      # The GUI depends on control-ofc-daemon>=X, so a successful dependency
+      # resolution also proves the daemon in the repo satisfies the GUI's floor —
+      # catching a repo that serves a mismatched pair.
+      - name: Dependency resolution matches the documented install
+        run: |
+          set -euo pipefail
+          pacman -S --print --noconfirm control-ofc-gui | tee /tmp/plan.txt
+          grep -q 'control-ofc-daemon' /tmp/plan.txt \
+            || { echo "::error::control-ofc-gui did not pull in control-ofc-daemon"; exit 1; }
+
+      - name: Summary
+        run: |
+          {
+            echo "### Clean-machine install verified"
+            echo "- key trusted from raw.githubusercontent"
+            echo "- database signature verified (SigLevel = Required)"
+            echo "- both packages downloaded and signature-checked"
+          } >> "$GITHUB_STEP_SUMMARY"

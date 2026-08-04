@@ -1,0 +1,174 @@
+name: Publish pacman repository
+
+# Assembles the signed [control-ofc] pacman repository and publishes it as the
+# assets of one rolling GitHub Release (tag `repo`).
+#
+# The job is DECLARATIVE, not incremental: every run rebuilds the whole database
+# from the current latest release of each source project. There is no state
+# carried between runs, so the job is idempotent, has no retention logic to get
+# wrong, and cannot end up advertising a package it did not upload. Re-running it
+# is always safe.
+#
+# Signing happens here rather than in the source repos so the GPG private key
+# lives in exactly one repository's secrets (DEC-241). The signature attests
+# "this repository published these bytes", which is ordinary repo semantics.
+#
+# Why `repo-add --sign` is NOT used: it shells out to gpg without loopback
+# pinentry, so a passphrase-protected key cannot be used non-interactively. The
+# database is built unsigned and then signed explicitly below, which is the same
+# result with control over how the passphrase is supplied.
+
+on:
+  workflow_dispatch:
+  # Fired by the source repos once their release is published (plan step 5).
+  # Payload is ignored on purpose — the run always reassembles from scratch.
+  repository_dispatch:
+    types: [package-released]
+
+permissions:
+  contents: write
+
+# A simultaneous GUI + daemon release must serialise. Two concurrent runs would
+# race on the release assets and one package could silently vanish from the DB.
+concurrency:
+  group: publish-pacman-repo
+  cancel-in-progress: false
+
+env:
+  REPO_NAME: control-ofc
+  REPO_TAG: repo
+  SIGNING_KEY: 4AAD6D2DE40D0D10773BF770BC27C5EB2831FCDA
+
+jobs:
+  publish:
+    name: Assemble and publish
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install tooling
+        run: pacman -Syu --noconfirm --needed pacman-contrib github-cli git
+
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # Public repos, so the ambient GITHUB_TOKEN is enough to read their
+      # releases — no cross-repo PAT needed on this side.
+      - name: Download the newest package from each project
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          for project in control-ofc-daemon control-ofc-gui; do
+            echo "::group::$project"
+            gh release download \
+              --repo "Plan-B-Development/$project" \
+              --pattern '*.pkg.tar.zst' \
+              --dir build
+            echo "::endgroup::"
+          done
+          # A -debug- package is build scaffolding, never something to serve.
+          rm -f build/*-debug-*.pkg.tar.zst
+          count=$(ls -1 build/*.pkg.tar.zst 2>/dev/null | wc -l)
+          if [ "$count" -ne 2 ]; then
+            echo "::error::expected exactly 2 packages (daemon + gui), got ${count}"
+            ls -l build/ || true
+            exit 1
+          fi
+          ls -l build/
+
+      - name: Import the signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --quiet --import
+          # Mark it ultimately trusted so gpg will sign with it non-interactively.
+          printf '%s:6:\n' "$SIGNING_KEY" | gpg --batch --import-ownertrust
+          gpg --list-secret-keys --keyid-format=long
+
+      # Each package needs its own detached signature as a sibling file: with
+      # `SigLevel = Required`, pacman fetches `<pkg>.pkg.tar.zst.sig` from the
+      # same Server URL. repo-add then embeds that signature into the database,
+      # which is why signing must happen BEFORE repo-add runs.
+      - name: Sign the packages
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          cd build
+          for pkg in *.pkg.tar.zst; do
+            gpg --batch --yes --pinentry-mode loopback \
+                --passphrase "$GPG_PASSPHRASE" \
+                --local-user "$SIGNING_KEY" \
+                --detach-sign --no-armor "$pkg"
+            gpg --verify "$pkg.sig" "$pkg"
+          done
+          ls -l
+
+      - name: Build and sign the database
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          cd build
+          repo-add "${REPO_NAME}.db.tar.gz" ./*.pkg.tar.zst
+
+          for db in "${REPO_NAME}.db.tar.gz" "${REPO_NAME}.files.tar.gz"; do
+            gpg --batch --yes --pinentry-mode loopback \
+                --passphrase "$GPG_PASSPHRASE" \
+                --local-user "$SIGNING_KEY" \
+                --detach-sign --no-armor "$db"
+            gpg --verify "$db.sig" "$db"
+          done
+
+          # repo-add leaves `<repo>.db` and `<repo>.files` as SYMLINKS to the
+          # .tar.gz archives. GitHub Release assets are flat files with no
+          # symlink support, so uploading them verbatim ships a broken database
+          # — the single most common way this setup fails. Replace them with
+          # real copies. The .sig of the .tar.gz verifies the copy too, since
+          # the bytes are identical.
+          rm -f "${REPO_NAME}.db" "${REPO_NAME}.files"
+          cp "${REPO_NAME}.db.tar.gz"        "${REPO_NAME}.db"
+          cp "${REPO_NAME}.files.tar.gz"     "${REPO_NAME}.files"
+          cp "${REPO_NAME}.db.tar.gz.sig"    "${REPO_NAME}.db.sig"
+          cp "${REPO_NAME}.files.tar.gz.sig" "${REPO_NAME}.files.sig"
+
+          for f in "${REPO_NAME}.db" "${REPO_NAME}.files"; do
+            if [ -L "$f" ]; then
+              echo "::error::$f is still a symlink — it would upload as a broken database"
+              exit 1
+            fi
+          done
+          gpg --verify "${REPO_NAME}.db.sig" "${REPO_NAME}.db"
+          ls -l
+
+      - name: Publish the repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cp keys/control-ofc.gpg build/
+          cd build
+
+          if ! gh release view "$REPO_TAG" >/dev/null 2>&1; then
+            gh release create "$REPO_TAG" \
+              --target "${GITHUB_SHA}" \
+              --title "control-ofc pacman repository" \
+              --notes "Rolling repository assets. Do not delete this release — \
+          it is the pacman \`Server\` endpoint. Regenerated by the publish workflow."
+          fi
+
+          # One batch, so the database and the packages it references land
+          # together. A window where the DB advertises a package that is not yet
+          # uploaded gives users a hard 404 mid-`pacman -Syu`.
+          gh release upload "$REPO_TAG" --clobber \
+            "${REPO_NAME}.db" "${REPO_NAME}.db.sig" \
+            "${REPO_NAME}.files" "${REPO_NAME}.files.sig" \
+            ./*.pkg.tar.zst ./*.pkg.tar.zst.sig \
+            control-ofc.gpg
+
+          echo "### Published" >> "$GITHUB_STEP_SUMMARY"
+          for pkg in *.pkg.tar.zst; do
+            echo "- \`$pkg\`" >> "$GITHUB_STEP_SUMMARY"
+          done
