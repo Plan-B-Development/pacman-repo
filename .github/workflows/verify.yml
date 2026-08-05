@@ -23,6 +23,28 @@ on:
 permissions:
   contents: read
 
+# Deliberately the SAME group as `Publish pacman repository`, so verification can
+# never run while a publish is rewriting the release assets. `gh release upload
+# --clobber` deletes an asset before re-uploading it, so during a publish the
+# database and its signature genuinely 404 for a moment. Observed 2026-08-05: a
+# simultaneous GUI + daemon release ran this workflow (chained off the first
+# publish) straight through the second publish's upload window, and it failed on
+# `failed retrieving file 'control-ofc.db.sig' ... 404` against a repository that
+# was perfectly healthy.
+#
+# That costs more than one red tick. This workflow is the staleness alarm for a
+# dead notify token or a failed publish, and an alarm that cries wolf on every
+# dual release is one nobody reads — which is exactly how a broken
+# PACMAN_REPO_TOKEN went unnoticed for a day.
+#
+# `cancel-in-progress: false` is safe on both sides: publishing is declarative
+# (every run rebuilds the whole database from the current latest releases), so a
+# superseded pending run being dropped loses nothing, and a queued publish simply
+# waits out a verify rather than racing it.
+concurrency:
+  group: publish-pacman-repo
+  cancel-in-progress: false
+
 env:
   SIGNING_KEY: 4AAD6D2DE40D0D10773BF770BC27C5EB2831FCDA
 
