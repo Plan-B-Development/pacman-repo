@@ -34,12 +34,12 @@ EOF
 ### 3. Install
 
 ```bash
-sudo pacman -Sy control-ofc-gui
+sudo pacman -Syu control-ofc-gui
 sudo systemctl enable --now control-ofc-daemon
 ```
 
 `control-ofc-daemon` is pulled in automatically as a dependency of the GUI. If
-you only want the daemon (headless), `sudo pacman -Sy control-ofc-daemon`.
+you only want the daemon (headless), `sudo pacman -Syu control-ofc-daemon`.
 
 ---
 
@@ -123,8 +123,11 @@ using the exact commands above, and runs daily on a schedule — because this
 repository can break with nobody touching it (expired key, deleted asset), and
 the alternative discovery mechanism is a user's `pacman -Syu` failing.
 
-The GPG private key exists only in this repository's Actions secrets. The source
-repositories never hold it; they only trigger a rebuild.
+This repository's Actions secrets hold the only copy of the GPG private key in
+any CI system — the source repositories never hold it, they only trigger a
+rebuild. A passphrase-protected backup is kept offline in the maintainer's
+keyring, which is what makes key loss recoverable; it is deliberately never
+placed in a repository or a CI environment.
 
 > **Do not delete the `repo` release.** It is the `Server` endpoint — deleting it
 > breaks `pacman -Sy` for every existing user.

@@ -13,6 +13,11 @@ name: Publish pacman repository
 # lives in exactly one repository's secrets (DEC-241). The signature attests
 # "this repository published these bytes", which is ordinary repo semantics.
 #
+# What it does NOT attest by itself is that the bytes came from a legitimate
+# build — so every downloaded package's Sigstore build provenance is verified
+# before the signing key is imported (DEC-242). Signing is downstream of
+# verification, never a substitute for it.
+#
 # Why `repo-add --sign` is NOT used: it shells out to gpg without loopback
 # pinentry, so a passphrase-protected key cannot be used non-interactively. The
 # database is built unsigned and then signed explicitly below, which is the same
@@ -84,6 +89,38 @@ jobs:
             exit 1
           fi
           ls -l build/
+
+      # The GPG signature applied below is the ENTIRE trust basis of
+      # `SigLevel = Required`: pacman installs whatever this job signs, silently,
+      # on every `pacman -Syu`. Signing an asset we never authenticated would
+      # launder a substituted or compromised upload into a trusted package on
+      # every user's machine — the source-repo release is downloaded over the
+      # API, but "it was attached to a release" is not provenance.
+      #
+      # `gh attestation verify` checks the keyless Sigstore build provenance that
+      # each source repo's release.yml attaches (DEC-239). --signer-workflow pins
+      # WHICH workflow may have produced it, so an attestation from some other
+      # workflow in the same repo — or from a fork — cannot satisfy the check.
+      #
+      # Deliberately fail-closed and placed BEFORE the key import: an unverifiable
+      # package must stop the run while the private key is still untouched.
+      - name: Verify build provenance before signing anything
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for project in control-ofc-daemon control-ofc-gui; do
+            mapfile -t pkgs < <(ls -1 "build/${project}"-[0-9]*.pkg.tar.zst)
+            if [ "${#pkgs[@]}" -ne 1 ]; then
+              echo "::error::expected exactly 1 ${project} package, got ${#pkgs[@]}"
+              exit 1
+            fi
+            echo "::group::verify ${pkgs[0]}"
+            gh attestation verify "${pkgs[0]}" \
+              --repo "Plan-B-Development/${project}" \
+              --signer-workflow "Plan-B-Development/${project}/.github/workflows/release.yml"
+            echo "::endgroup::"
+          done
 
       - name: Import the signing key
         env:
