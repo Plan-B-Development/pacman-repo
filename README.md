@@ -12,7 +12,55 @@ Set it up once and both packages upgrade with your normal `pacman -Syu`.
 
 ## Install
 
-### 1. Trust the signing key
+Two ways. The script does the same four steps as the manual path, checks the
+signing key's fingerprint before trusting it, and is safe to re-run.
+
+### Option A — bootstrap script (recommended)
+
+Download it, check its signature, read it, then run it. Deliberately **not** a
+`curl … | sh` one-liner: this script edits `/etc/pacman.conf` and installs a
+package that runs as a system service, which is not something to pipe unseen
+into a shell.
+
+```bash
+base=https://github.com/Plan-B-Development/pacman-repo/releases/download/repo
+curl -fsSLO "$base/bootstrap.sh"
+curl -fsSLO "$base/bootstrap.sh.sig"
+
+# Verify it was signed by this repository's release key
+curl -fsSL https://raw.githubusercontent.com/Plan-B-Development/pacman-repo/main/keys/control-ofc.gpg | gpg --import
+gpg --verify bootstrap.sh.sig bootstrap.sh
+```
+
+`gpg --verify` must report a good signature from:
+
+```
+4AAD6D2DE40D0D10773BF770BC27C5EB2831FCDA
+```
+
+Compare that fingerprint character by character. gpg will also warn that the key
+is not certified with a trusted signature — that is expected, and the
+fingerprint is what settles it. Then read the script and run it:
+
+```bash
+less bootstrap.sh
+bash ./bootstrap.sh
+```
+
+It trusts the signing key (verifying the fingerprint first), adds the
+repository, installs both packages, and enables the daemon. Re-running it is
+safe — every step checks its own end state, so an interrupted run can just be
+run again.
+
+The install step is a **full system upgrade** (`pacman -Syu`), because installing
+into a partially-upgraded system is not something Arch supports. That step is
+interactive: pacman lists everything it is about to do and asks you to confirm
+once. So the script is not suitable for unattended use, and it may upgrade more
+than just control-ofc.
+
+### Option B — by hand
+
+#### 1. Trust the signing key
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Plan-B-Development/pacman-repo/main/keys/control-ofc.gpg \
@@ -20,10 +68,16 @@ curl -fsSL https://raw.githubusercontent.com/Plan-B-Development/pacman-repo/main
 sudo pacman-key --lsign-key 4AAD6D2DE40D0D10773BF770BC27C5EB2831FCDA
 ```
 
-### 2. Add the repository
+#### 2. Add the repository
+
+> **Run this once.** `tee -a` appends, so running it a second time adds a
+> duplicate `[control-ofc]` block and pacman then warns about a redefined
+> repository. Check first with `grep -n '^\[control-ofc\]' /etc/pacman.conf` — if
+> the block is already there, edit it instead of appending, or use Option A,
+> which handles this for you.
 
 ```bash
-sudo tee -a /etc/pacman.conf <<'EOF'
+grep -q '^\[control-ofc\]' /etc/pacman.conf || sudo tee -a /etc/pacman.conf <<'EOF'
 
 [control-ofc]
 SigLevel = Required
@@ -31,7 +85,7 @@ Server = https://github.com/Plan-B-Development/pacman-repo/releases/download/rep
 EOF
 ```
 
-### 3. Install
+#### 3. Install
 
 ```bash
 sudo pacman -Syu control-ofc-gui
@@ -40,6 +94,9 @@ sudo systemctl enable --now control-ofc-daemon
 
 `control-ofc-daemon` is pulled in automatically as a dependency of the GUI. If
 you only want the daemon (headless), `sudo pacman -Syu control-ofc-daemon`.
+
+Do not skip `systemctl enable --now` — the GUI talks to the daemon over a Unix
+socket and opens to a "disconnected" screen without it.
 
 ---
 
@@ -112,11 +169,21 @@ it is always safe and there is no accumulated state to drift.
 1. download the newest `.pkg.tar.zst` from each source repo's latest Release
 2. detach-sign each package (`.sig` sibling — required by `SigLevel = Required`)
 3. `repo-add`, which embeds those signatures into the database
-4. sign the database, and replace `repo-add`'s **symlinks** with real copies
-   (GitHub Release assets cannot be symlinks — this is the classic way this
-   setup ships a broken database)
-5. upload everything to the rolling `repo` release in one batch, so the database
-   never advertises a package that has not been uploaded yet
+4. sign the database and `bootstrap.sh`, and replace `repo-add`'s **symlinks**
+   with real copies (GitHub Release assets cannot be symlinks — this is the
+   classic way this setup ships a broken database)
+5. upload in a **deliberate order**: packages and their signatures first, then
+   the database staged under temporary names and swapped in by rename
+
+Step 5's ordering is the part that is easy to get wrong. The database is the
+pointer, so it must land *last* — nothing may reference a package that is not
+already uploaded. It is swapped in by renaming an already-uploaded asset rather
+than deleted-and-re-uploaded, because `gh release upload --clobber` removes an
+asset before replacing it: the old arrangement left `control-ofc.db` genuinely
+absent for the length of an upload, and a `pacman -Sy` landing in that window got
+a 404 from a completely healthy repository. Renaming shrinks that window to a
+metadata call. It is *effectively* atomic, not atomic — GitHub has no
+transaction across release assets.
 
 `verify.yml` then installs from the published result in a clean Arch container
 using the exact commands above, and runs daily on a schedule — because this
