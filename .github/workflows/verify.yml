@@ -157,3 +157,166 @@ jobs:
             echo "- both packages downloaded and signature-checked"
             echo "- served versions match the latest upstream releases"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # The job above verifies README Option B — the manual, copy-paste install. It
+  # does NOT touch bootstrap.sh, which is the path README.md recommends FIRST.
+  # So the recommended install path was the one nothing tested, while the
+  # fallback was covered. This job closes that.
+  bootstrap:
+    name: Clean-machine install via bootstrap.sh
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Prepare a clean machine
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed curl
+          pacman-key --init
+          pacman-key --populate archlinux
+
+      # bootstrap.sh is DELIBERATELY unsuitable for unattended use: its final
+      # install step is interactive on purpose, so a user sees and agrees to a
+      # transaction that may upgrade far more than control-ofc. That property is
+      # worth keeping, so CI drives the script from outside rather than adding an
+      # --unattended flag to it. Two PATH shims, no edit to the script:
+      #
+      #   pacman    — appends --noconfirm (accepted on every operation)
+      #   systemctl — absent in a container; is-enabled/is-active return 1 so the
+      #               script takes its `enable --now` branch, which then no-ops
+      #
+      # /usr/local/bin precedes /usr/bin, and the script runs as root so its
+      # $SUDO is empty — meaning these shims are what it actually calls.
+      - name: Install non-interactive shims
+        run: |
+          set -euo pipefail
+          cat > /usr/local/bin/pacman <<'SHIM'
+          #!/bin/sh
+          exec /usr/bin/pacman "$@" --noconfirm
+          SHIM
+          cat > /usr/local/bin/systemctl <<'SHIM'
+          #!/bin/sh
+          case "${1:-}" in
+            is-enabled|is-active) exit 1 ;;
+            *) echo "[ci-shim] systemctl $*"; exit 0 ;;
+          esac
+          SHIM
+          chmod +x /usr/local/bin/pacman /usr/local/bin/systemctl
+
+      # gh is deliberately NOT installed. The script's Sigstore provenance check
+      # is optional-by-design and skips when gh is missing or unauthenticated —
+      # which is the state a genuinely fresh machine is in. Running it that way
+      # exercises the documented fallback rather than a path most users never hit.
+      - name: Run bootstrap.sh end to end
+        run: |
+          set -euo pipefail
+          chmod +x ./bootstrap.sh
+          ./bootstrap.sh
+
+      - name: Both packages are actually installed
+        run: |
+          set -euo pipefail
+          for pkg in control-ofc-daemon control-ofc-gui; do
+            /usr/bin/pacman -Qi "$pkg" > /dev/null \
+              || { echo "::error::bootstrap.sh finished but $pkg is not installed"; exit 1; }
+            echo "ok: $pkg installed"
+          done
+          grep -q '^\[control-ofc\]' /etc/pacman.conf \
+            || { echo "::error::bootstrap.sh did not add the [control-ofc] section"; exit 1; }
+
+      # Idempotence is a documented property of the script (the old README's
+      # copy-pasteable `tee -a` was what broke it). A second run must be a no-op,
+      # not a duplicated pacman.conf section.
+      - name: Re-running is idempotent
+        run: |
+          set -euo pipefail
+          ./bootstrap.sh
+          n=$(grep -c '^\[control-ofc\]' /etc/pacman.conf)
+          [ "$n" -eq 1 ] \
+            || { echo "::error::[control-ofc] appears $n times in pacman.conf after two runs"; exit 1; }
+          echo "ok: pacman.conf still has exactly one [control-ofc] section"
+
+  # The signing-key fingerprint is pinned in five places across this repo. Nothing
+  # compared them, so a key rotation would have to be caught by hand in all five
+  # — and a miss means either a fail-closed install (the lucky case) or a stale
+  # fingerprint quietly trusted somewhere.
+  fingerprint:
+    name: Signing key is consistent and not near expiry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: All five pins agree with the key file
+        run: |
+          set -euo pipefail
+
+          # The key file is the source of truth: it is what users import.
+          actual=$(gpg --show-keys --with-colons keys/control-ofc.gpg \
+                     | awk -F: '/^fpr:/ {print $10; exit}')
+          [ -n "$actual" ] || { echo "::error::could not read a fingerprint from keys/control-ofc.gpg"; exit 1; }
+          echo "keys/control-ofc.gpg -> $actual"
+
+          fail=0
+          check() {  # check <label> <file> <expected-count-at-least>
+            n=$(grep -c "$actual" "$2" || true)
+            if [ "$n" -lt "$3" ]; then
+              echo "::error::$1 ($2): expected at least $3 occurrence(s) of $actual, found $n"
+              fail=1
+            else
+              echo "ok: $1 pins $actual ($n occurrence(s))"
+            fi
+          }
+
+          check "bootstrap.sh KEY_FPR"      bootstrap.sh                    1
+          check "publish.yml SIGNING_KEY"   .github/workflows/publish.yml   1
+          check "verify.yml SIGNING_KEY"    .github/workflows/verify.yml    1
+          check "README install docs"       README.md                       2
+
+          exit "$fail"
+
+      # DEC-241 says in terms: "A silently expired key breaks every user's
+      # `pacman -Syu` simultaneously. Rotation must happen before then." It had no
+      # alarm — the consequence was written down and then left to a calendar
+      # nobody keeps (register row OPEN-07a).
+      #
+      # This is the right home for it: verify.yml already runs daily and already
+      # exists to catch things that break with nobody touching them. Failing at
+      # T-90 rather than at expiry is the point — rotating a signing key,
+      # re-pinning five places and getting it into users' keyrings is not a
+      # same-day job, and by the time `pacman -Syu` breaks it is far too late.
+      - name: Key is not approaching expiry
+        run: |
+          set -euo pipefail
+
+          expiry=$(gpg --show-keys --with-colons keys/control-ofc.gpg \
+                     | awk -F: '/^pub:/ {print $7; exit}')
+          if [ -z "$expiry" ]; then
+            echo "::error::keys/control-ofc.gpg has no expiry date. That is not"
+            echo "::error::reassuring — it means this check cannot do its job."
+            exit 1
+          fi
+
+          now=$(date -u +%s)
+          days=$(( (expiry - now) / 86400 ))
+          echo "signing key expires $(date -u -d "@$expiry" +%Y-%m-%d) — $days day(s) away"
+
+          if [ "$days" -le 0 ]; then
+            echo "::error::THE SIGNING KEY HAS EXPIRED. Every user's \`pacman -Syu\` is"
+            echo "::error::failing right now. Rotate the key, re-pin it in all five"
+            echo "::error::places, and republish."
+            exit 1
+          elif [ "$days" -le 90 ]; then
+            echo "::error::The signing key expires in $days day(s). Rotate it NOW:"
+            echo "::error::generate the new key, update keys/control-ofc.gpg, re-pin the"
+            echo "::error::fingerprint in bootstrap.sh, publish.yml, verify.yml and"
+            echo "::error::README.md, then republish so users pick it up before expiry."
+            exit 1
+          elif [ "$days" -le 180 ]; then
+            echo "::warning::The signing key expires in $days day(s). Plan the rotation."
+          fi
+
+          echo "ok: $days day(s) of validity remaining"
