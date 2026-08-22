@@ -1,0 +1,13 @@
+# Local Claude Code configuration — never publish.
+#
+# This repository is PUBLIC and is the primary install path for the project
+# (DEC-241). `.claude/` was previously excluded only by `.git/info/exclude`,
+# which is untracked and therefore lost on a fresh clone — so a re-clone would
+# have offered to commit local Claude config, hooks and permission rules into a
+# published repository. A tracked .gitignore is what actually survives a clone.
+.claude/
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store
