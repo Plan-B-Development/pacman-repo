@@ -1,8 +1,8 @@
-# control-ofc pacman repository
+# Ventulus pacman repository
 
-Signed Arch Linux package repository for [Control-OFC](https://github.com/Plan-B-Development/control-ofc-gui)
-— a desktop fan control app (`control-ofc-gui`) and its hardware daemon
-(`control-ofc-daemon`).
+Signed Arch Linux package repository for [Ventulus](https://github.com/Plan-B-Development/ventulus)
+(formerly Control-OFC) — a desktop fan control app (`ventulus`) and its hardware
+daemon (`ventulusd`).
 
 Set it up once and both packages upgrade with your normal `pacman -Syu`.
 
@@ -28,7 +28,7 @@ curl -fsSLO "$base/bootstrap.sh"
 curl -fsSLO "$base/bootstrap.sh.sig"
 
 # Verify it was signed by this repository's release key
-curl -fsSL https://raw.githubusercontent.com/Plan-B-Development/pacman-repo/main/keys/control-ofc.gpg | gpg --import
+curl -fsSL https://raw.githubusercontent.com/Plan-B-Development/pacman-repo/main/keys/ventulus.gpg | gpg --import
 gpg --verify bootstrap.sh.sig bootstrap.sh
 ```
 
@@ -56,14 +56,14 @@ The install step is a **full system upgrade** (`pacman -Syu`), because installin
 into a partially-upgraded system is not something Arch supports. That step is
 interactive: pacman lists everything it is about to do and asks you to confirm
 once. So the script is not suitable for unattended use, and it may upgrade more
-than just control-ofc.
+than just Ventulus.
 
 ### Option B — by hand
 
 #### 1. Trust the signing key
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Plan-B-Development/pacman-repo/main/keys/control-ofc.gpg \
+curl -fsSL https://raw.githubusercontent.com/Plan-B-Development/pacman-repo/main/keys/ventulus.gpg \
   | sudo pacman-key --add -
 sudo pacman-key --lsign-key 4AAD6D2DE40D0D10773BF770BC27C5EB2831FCDA
 ```
@@ -71,15 +71,15 @@ sudo pacman-key --lsign-key 4AAD6D2DE40D0D10773BF770BC27C5EB2831FCDA
 #### 2. Add the repository
 
 > **Run this once.** `tee -a` appends, so running it a second time adds a
-> duplicate `[control-ofc]` block and pacman then warns about a redefined
-> repository. Check first with `grep -n '^\[control-ofc\]' /etc/pacman.conf` — if
+> duplicate `[ventulus]` block and pacman then warns about a redefined
+> repository. Check first with `grep -n '^\[ventulus\]' /etc/pacman.conf` — if
 > the block is already there, edit it instead of appending, or use Option A,
 > which handles this for you.
 
 ```bash
-grep -q '^\[control-ofc\]' /etc/pacman.conf || sudo tee -a /etc/pacman.conf <<'EOF'
+grep -q '^\[ventulus\]' /etc/pacman.conf || sudo tee -a /etc/pacman.conf <<'EOF'
 
-[control-ofc]
+[ventulus]
 SigLevel = Required
 Server = https://github.com/Plan-B-Development/pacman-repo/releases/download/repo
 EOF
@@ -88,12 +88,12 @@ EOF
 #### 3. Install
 
 ```bash
-sudo pacman -Syu control-ofc-gui
-sudo systemctl enable --now control-ofc-daemon
+sudo pacman -Syu ventulus
+sudo systemctl enable --now ventulusd
 ```
 
-`control-ofc-daemon` is pulled in automatically as a dependency of the GUI. If
-you only want the daemon (headless), `sudo pacman -Syu control-ofc-daemon`.
+`ventulusd` is pulled in automatically as a dependency of the GUI. If you only
+want the daemon (headless), `sudo pacman -Syu ventulusd`.
 
 Do not skip `systemctl enable --now` — the GUI talks to the daemon over a Unix
 socket and opens to a "disconnected" screen without it.
@@ -111,11 +111,11 @@ That's it. There is nothing to re-run and nothing to re-download by hand.
 ## Removing
 
 ```bash
-sudo pacman -Rns control-ofc-gui control-ofc-daemon
+sudo pacman -Rns ventulus ventulusd
 sudo pacman-key --delete 4AAD6D2DE40D0D10773BF770BC27C5EB2831FCDA
 ```
 
-…then delete the `[control-ofc]` block from `/etc/pacman.conf`.
+…then delete the `[ventulus]` block from `/etc/pacman.conf`.
 
 ---
 
@@ -139,7 +139,7 @@ The upstream releases additionally carry a keyless [Sigstore](https://www.sigsto
 build-provenance attestation, verifiable against the source repository:
 
 ```bash
-gh attestation verify <pkg>.pkg.tar.zst --repo Plan-B-Development/control-ofc-gui
+gh attestation verify <pkg>.pkg.tar.zst --repo Plan-B-Development/ventulus   # or ventulusd
 ```
 
 ---
@@ -150,9 +150,9 @@ The packages are also attached to every upstream GitHub Release, so a one-off
 install needs nothing from here:
 
 ```bash
-gh release download --repo Plan-B-Development/control-ofc-daemon --pattern '*.pkg.tar.zst'
-gh release download --repo Plan-B-Development/control-ofc-gui    --pattern '*.pkg.tar.zst'
-sudo pacman -U ./control-ofc-daemon-*.pkg.tar.zst ./control-ofc-gui-*.pkg.tar.zst
+gh release download --repo Plan-B-Development/ventulusd --pattern '*.pkg.tar.zst'
+gh release download --repo Plan-B-Development/ventulus  --pattern '*.pkg.tar.zst'
+sudo pacman -U ./ventulusd-*.pkg.tar.zst ./ventulus-[0-9]*.pkg.tar.zst
 ```
 
 Upgrading then means repeating those commands. That is the trade this repository
@@ -168,7 +168,8 @@ it is always safe and there is no accumulated state to drift.
 
 1. download the newest `.pkg.tar.zst` from each source repo's latest Release
 2. detach-sign each package (`.sig` sibling — required by `SigLevel = Required`)
-3. `repo-add`, which embeds those signatures into the database
+3. `repo-add`, which embeds those signatures into the database — run twice, for
+   `ventulus.db` and for the transitional `control-ofc.db`, from the same packages
 4. sign the database and `bootstrap.sh`, and replace `repo-add`'s **symlinks**
    with real copies (GitHub Release assets cannot be symlinks — this is the
    classic way this setup ships a broken database)

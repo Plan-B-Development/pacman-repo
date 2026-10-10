@@ -47,16 +47,30 @@ concurrency:
 
 env:
   SIGNING_KEY: 4AAD6D2DE40D0D10773BF770BC27C5EB2831FCDA
+  # Every section the repository serves: publish.yml's REPO_NAMES, and the
+  # `verify` matrix below (which cannot read env). `fingerprint` checks all three
+  # agree, so ending the [control-ofc] alias in one place cannot leave this
+  # workflow red against a database that was meant to be gone.
+  SECTIONS: ventulus control-ofc
 
 jobs:
   verify:
-    name: Clean-machine install
+    name: Clean-machine install ([${{ matrix.section }}])
     runs-on: ubuntu-latest
     container: archlinux:latest
     # Do not chase a publish that already failed.
     if: >-
       github.event_name != 'workflow_run' ||
       github.event.workflow_run.conclusion == 'success'
+    # `ventulus` is the repository; `control-ofc` is the same packages under the
+    # old section name, kept so existing pacman.conf files keep upgrading (see
+    # publish.yml). Each is installed exactly as its users configured it.
+    strategy:
+      fail-fast: false
+      matrix:
+        section: [ventulus, control-ofc]
+    env:
+      SECTION: ${{ matrix.section }}
     steps:
       - name: Prepare a clean pacman keyring
         run: |
@@ -67,11 +81,12 @@ jobs:
 
       # Deliberately fetched over raw.githubusercontent, exactly as README.md
       # tells users to — so this step fails if that URL ever stops serving the
-      # key, which is a documented install step breaking.
+      # key, which is a documented install step breaking. Each section fetches
+      # the key file its own instructions name.
       - name: Trust the repository signing key
         run: |
           set -euo pipefail
-          curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/keys/control-ofc.gpg" \
+          curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/keys/${SECTION}.gpg" \
             | pacman-key --add -
           pacman-key --lsign-key "$SIGNING_KEY"
 
@@ -80,7 +95,7 @@ jobs:
           set -euo pipefail
           cat >> /etc/pacman.conf <<EOF
 
-          [control-ofc]
+          [${SECTION}]
           SigLevel = Required
           Server = https://github.com/${GITHUB_REPOSITORY}/releases/download/repo
           EOF
@@ -95,30 +110,59 @@ jobs:
       - name: Both packages are visible and resolvable
         run: |
           set -euo pipefail
-          pacman -Sl control-ofc
-          for pkg in control-ofc-daemon control-ofc-gui; do
-            pacman -Si "control-ofc/$pkg" > /dev/null
-            echo "ok: $pkg is in the repository"
+          pacman -Sl "$SECTION"
+          for pkg in ventulusd ventulus; do
+            pacman -Si "${SECTION}/$pkg" > /dev/null
+            echo "ok: $pkg is in [${SECTION}]"
+          done
+
+      # What carries a Control-OFC install across on its next `pacman -Syu`. If
+      # a package lost its replaces=, old installs would silently stop upgrading.
+      - name: The packages replace their Control-OFC names
+        run: |
+          set -euo pipefail
+          for pair in ventulusd:control-ofc-daemon ventulus:control-ofc-gui; do
+            pkg=${pair%%:*} old=${pair#*:}
+            pacman -Si "${SECTION}/$pkg" | grep -E '^Replaces' | grep -qw -- "$old" \
+              || { echo "::error::${pkg} no longer replaces ${old}"; exit 1; }
+            echo "ok: $pkg replaces $old"
           done
 
       # The real test: download and signature-check the packages. This exercises
       # the per-package `.sig` sibling fetch, which is the part that silently
       # fails if a package was uploaded without its signature.
+      # The state a user mid-migration is in: the new section added while the old
+      # one is still there. Both serve the same packages; pacman must still sync
+      # and resolve the install. Run once, from the first leg.
+      - name: Every section configured together still resolves
+        if: matrix.section == 'ventulus'
+        run: |
+          set -euo pipefail
+          for other in $SECTIONS; do
+            [ "$other" = "$SECTION" ] && continue
+            printf '\n[%s]\nSigLevel = Required\nServer = https://github.com/%s/releases/download/repo\n' \
+              "$other" "$GITHUB_REPOSITORY" >> /etc/pacman.conf
+          done
+          pacman -Sy --noconfirm
+          pacman -S --print --noconfirm ventulus | tee /tmp/plan-all.txt
+          grep -q 'ventulusd' /tmp/plan-all.txt \
+            || { echo "::error::with every section configured, ventulus did not pull in ventulusd"; exit 1; }
+
       - name: Download and verify the packages
         run: |
           set -euo pipefail
-          pacman -Sw --noconfirm control-ofc-gui
+          pacman -Sw --noconfirm ventulus
           ls -l /var/cache/pacman/pkg/
 
-      # The GUI depends on control-ofc-daemon>=X, so a successful dependency
-      # resolution also proves the daemon in the repo satisfies the GUI's floor —
-      # catching a repo that serves a mismatched pair.
+      # The GUI depends on ventulusd>=X, so a successful dependency resolution
+      # also proves the daemon in the repo satisfies the GUI's floor — catching a
+      # repo that serves a mismatched pair.
       - name: Dependency resolution matches the documented install
         run: |
           set -euo pipefail
-          pacman -S --print --noconfirm control-ofc-gui | tee /tmp/plan.txt
-          grep -q 'control-ofc-daemon' /tmp/plan.txt \
-            || { echo "::error::control-ofc-gui did not pull in control-ofc-daemon"; exit 1; }
+          pacman -S --print --noconfirm ventulus | tee /tmp/plan.txt
+          grep -q 'ventulusd' /tmp/plan.txt \
+            || { echo "::error::ventulus did not pull in ventulusd"; exit 1; }
 
       # Staleness alarm. Everything above passes just as happily against a
       # repository frozen ten versions ago — an install that works is not an
@@ -134,13 +178,13 @@ jobs:
           set -euo pipefail
           pacman -Syu --noconfirm --needed github-cli
           stale=0
-          for pkg in control-ofc-daemon control-ofc-gui; do
+          for pkg in ventulusd ventulus; do
             upstream=$(gh release view --repo "Plan-B-Development/$pkg" \
                          --json tagName -q '.tagName' | sed 's/^v//')
-            served=$(pacman -Si "control-ofc/$pkg" \
+            served=$(pacman -Si "${SECTION}/$pkg" \
                        | awk '/^Version/ {print $3}' | sed 's/-[0-9]*$//')
             if [ "$upstream" != "$served" ]; then
-              echo "::error::${pkg}: repository serves ${served} but the latest release is ${upstream}. The publish workflow has not run for this release — check notify-repo in the source repo and the PACMAN_REPO_TOKEN secret."
+              echo "::error::${pkg}: [${SECTION}] serves ${served} but the latest release is ${upstream}. The publish workflow has not run for this release — check notify-repo in the source repo and the PACMAN_REPO_TOKEN secret."
               stale=1
             else
               echo "ok: ${pkg} ${served} matches the latest release"
@@ -151,10 +195,11 @@ jobs:
       - name: Summary
         run: |
           {
-            echo "### Clean-machine install verified"
-            echo "- key trusted from raw.githubusercontent"
+            echo "### Clean-machine install verified ([${SECTION}])"
+            echo "- key trusted from raw.githubusercontent (keys/${SECTION}.gpg)"
             echo "- database signature verified (SigLevel = Required)"
             echo "- both packages downloaded and signature-checked"
+            echo "- both packages replace their Control-OFC names"
             echo "- served versions match the latest upstream releases"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -181,7 +226,7 @@ jobs:
 
       # bootstrap.sh is DELIBERATELY unsuitable for unattended use: its final
       # install step is interactive on purpose, so a user sees and agrees to a
-      # transaction that may upgrade far more than control-ofc. That property is
+      # transaction that may upgrade far more than Ventulus. That property is
       # worth keeping, so CI drives the script from outside rather than adding an
       # --unattended flag to it. Two PATH shims, no edit to the script:
       #
@@ -220,13 +265,13 @@ jobs:
       - name: Both packages are actually installed
         run: |
           set -euo pipefail
-          for pkg in control-ofc-daemon control-ofc-gui; do
+          for pkg in ventulusd ventulus; do
             /usr/bin/pacman -Qi "$pkg" > /dev/null \
               || { echo "::error::bootstrap.sh finished but $pkg is not installed"; exit 1; }
             echo "ok: $pkg installed"
           done
-          grep -q '^\[control-ofc\]' /etc/pacman.conf \
-            || { echo "::error::bootstrap.sh did not add the [control-ofc] section"; exit 1; }
+          grep -q '^\[ventulus\]' /etc/pacman.conf \
+            || { echo "::error::bootstrap.sh did not add the [ventulus] section"; exit 1; }
 
       # Idempotence is a documented property of the script (the old README's
       # copy-pasteable `tee -a` was what broke it). A second run must be a no-op,
@@ -235,10 +280,10 @@ jobs:
         run: |
           set -euo pipefail
           ./bootstrap.sh
-          n=$(grep -c '^\[control-ofc\]' /etc/pacman.conf)
+          n=$(grep -c '^\[ventulus\]' /etc/pacman.conf)
           [ "$n" -eq 1 ] \
-            || { echo "::error::[control-ofc] appears $n times in pacman.conf after two runs"; exit 1; }
-          echo "ok: pacman.conf still has exactly one [control-ofc] section"
+            || { echo "::error::[ventulus] appears $n times in pacman.conf after two runs"; exit 1; }
+          echo "ok: pacman.conf still has exactly one [ventulus] section"
 
   # The signing-key fingerprint is pinned in five places across this repo. Nothing
   # compared them, so a key rotation would have to be caught by hand in all five
@@ -255,12 +300,20 @@ jobs:
           set -euo pipefail
 
           # The key file is the source of truth: it is what users import.
-          actual=$(gpg --show-keys --with-colons keys/control-ofc.gpg \
+          actual=$(gpg --show-keys --with-colons keys/ventulus.gpg \
                      | awk -F: '/^fpr:/ {print $10; exit}')
-          [ -n "$actual" ] || { echo "::error::could not read a fingerprint from keys/control-ofc.gpg"; exit 1; }
-          echo "keys/control-ofc.gpg -> $actual"
+          [ -n "$actual" ] || { echo "::error::could not read a fingerprint from keys/ventulus.gpg"; exit 1; }
+          echo "keys/ventulus.gpg -> $actual"
 
           fail=0
+          # keys/control-ofc.gpg is the same key under the old URL, still in
+          # existing users' instructions. It must stay byte-identical.
+          if ! cmp -s keys/ventulus.gpg keys/control-ofc.gpg; then
+            echo "::error::keys/control-ofc.gpg differs from keys/ventulus.gpg — both URLs must serve the same key"
+            fail=1
+          else
+            echo "ok: keys/control-ofc.gpg is identical to keys/ventulus.gpg"
+          fi
           check() {  # check <label> <file> <expected-count-at-least>
             n=$(grep -c "$actual" "$2" || true)
             if [ "$n" -lt "$3" ]; then
@@ -270,6 +323,21 @@ jobs:
               echo "ok: $1 pins $actual ($n occurrence(s))"
             fi
           }
+
+          # The served sections are listed three times; they must agree, and each
+          # needs its key file.
+          pub=$(sed -n 's/^  REPO_NAMES: //p' .github/workflows/publish.yml)
+          env_list=$(sed -n 's/^  SECTIONS: //p' .github/workflows/verify.yml)
+          matrix=$(sed -n 's/^        section: \[\(.*\)\]$/\1/p' .github/workflows/verify.yml | tr -d ',')
+          if [ -z "$pub" ] || [ "$pub" != "$env_list" ] || [ "$pub" != "$matrix" ]; then
+            echo "::error::served sections disagree: publish.yml REPO_NAMES='$pub', verify.yml SECTIONS='$env_list', verify matrix='$matrix'"
+            fail=1
+          else
+            echo "ok: publish.yml and verify.yml both serve: $pub"
+          fi
+          for name in $pub; do
+            [ -f "keys/${name}.gpg" ] || { echo "::error::keys/${name}.gpg is missing for section [${name}]"; fail=1; }
+          done
 
           check "bootstrap.sh KEY_FPR"      bootstrap.sh                    1
           check "publish.yml SIGNING_KEY"   .github/workflows/publish.yml   1
@@ -292,10 +360,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          expiry=$(gpg --show-keys --with-colons keys/control-ofc.gpg \
+          expiry=$(gpg --show-keys --with-colons keys/ventulus.gpg \
                      | awk -F: '/^pub:/ {print $7; exit}')
           if [ -z "$expiry" ]; then
-            echo "::error::keys/control-ofc.gpg has no expiry date. That is not"
+            echo "::error::keys/ventulus.gpg has no expiry date. That is not"
             echo "::error::reassuring — it means this check cannot do its job."
             exit 1
           fi
@@ -311,7 +379,7 @@ jobs:
             exit 1
           elif [ "$days" -le 90 ]; then
             echo "::error::The signing key expires in $days day(s). Rotate it NOW:"
-            echo "::error::generate the new key, update keys/control-ofc.gpg, re-pin the"
+            echo "::error::generate the new key, update keys/ventulus.gpg (and its copy keys/control-ofc.gpg), re-pin the"
             echo "::error::fingerprint in bootstrap.sh, publish.yml, verify.yml and"
             echo "::error::README.md, then republish so users pick it up before expiry."
             exit 1

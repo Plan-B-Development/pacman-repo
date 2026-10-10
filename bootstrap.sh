@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 #
-# Control-OFC first-install bootstrap (DEC-248).
+# Ventulus first-install bootstrap (DEC-248).
 #
 # Does the three things the README asks you to do by hand — trust the signing
-# key, add the [control-ofc] repository, install — plus the one step people
+# key, add the [ventulus] repository, install — plus the one step people
 # forget afterwards: starting the daemon. Without that last step the packages
 # install cleanly and the GUI opens to a "disconnected" screen, which reads as a
 # broken install.
 #
 # The install is a FULL system upgrade (`-Syuw` then `-Su`), never a targeted
 # install onto un-upgraded databases, which Arch does not support. That step is
-# interactive on purpose: it may upgrade much more than control-ofc, so pacman
+# interactive on purpose: it may upgrade much more than Ventulus, so pacman
 # shows the transaction and you confirm it once. The script is therefore not
 # suitable for unattended use.
 #
 # SAFE TO RE-RUN. Every step checks its own end state first, so a run that died
 # halfway (dropped network, cancelled sudo) can simply be run again. In
-# particular it will not append a second [control-ofc] block to pacman.conf —
+# particular it will not append a second [ventulus] block to pacman.conf —
 # the copy-pasteable `tee -a` in the old README did exactly that on a re-run.
 #
 # It assumes a working Arch x86_64 system. There is deliberately no distro or
@@ -28,12 +28,12 @@
 
 set -euo pipefail
 
-REPO_NAME='control-ofc'
+REPO_NAME='ventulus'
 KEY_FPR='4AAD6D2DE40D0D10773BF770BC27C5EB2831FCDA'
 KEY_URL="https://raw.githubusercontent.com/Plan-B-Development/pacman-repo/main/keys/${REPO_NAME}.gpg"
 SERVER_URL='https://github.com/Plan-B-Development/pacman-repo/releases/download/repo'
 PACMAN_CONF='/etc/pacman.conf'
-PROJECTS=(control-ofc-daemon control-ofc-gui)
+PROJECTS=(ventulusd ventulus)
 
 if [ "$(id -u)" -eq 0 ]; then
     SUDO=''
@@ -92,7 +92,7 @@ https://github.com/Plan-B-Development/pacman-repo/issues"
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Add the [control-ofc] repository
+# 2. Add the [ventulus] repository
 # ---------------------------------------------------------------------------
 say "Configuring $PACMAN_CONF"
 
@@ -102,7 +102,7 @@ SigLevel = Required
 Server = $SERVER_URL"
 
 section_field() {
-    # Print one field from inside the [control-ofc] section, ignoring the same
+    # Print one field from inside the [ventulus] section, ignoring the same
     # key if it appears under any other repository.
     awk -v key="$1" '
         /^\[/                { in_section = ($0 == "['"$REPO_NAME"']") ; next }
@@ -121,8 +121,8 @@ if grep -q "^\[$REPO_NAME\]" "$PACMAN_CONF"; then
         note "[$REPO_NAME] already configured correctly — leaving it alone"
     else
         note "[$REPO_NAME] exists but does not match — rewriting it"
-        $SUDO cp "$PACMAN_CONF" "${PACMAN_CONF}.control-ofc.bak"
-        note "previous file saved as ${PACMAN_CONF}.control-ofc.bak"
+        $SUDO cp "$PACMAN_CONF" "${PACMAN_CONF}.ventulus.bak"
+        note "previous file saved as ${PACMAN_CONF}.ventulus.bak"
 
         # Drop the existing section: skip from its header up to the next
         # section header (which is itself kept) or end of file.
@@ -137,8 +137,8 @@ if grep -q "^\[$REPO_NAME\]" "$PACMAN_CONF"; then
         note "[$REPO_NAME] updated"
     fi
 else
-    $SUDO cp "$PACMAN_CONF" "${PACMAN_CONF}.control-ofc.bak"
-    note "previous file saved as ${PACMAN_CONF}.control-ofc.bak"
+    $SUDO cp "$PACMAN_CONF" "${PACMAN_CONF}.ventulus.bak"
+    note "previous file saved as ${PACMAN_CONF}.ventulus.bak"
     printf '%s\n' "$desired_block" | $SUDO tee -a "$PACMAN_CONF" >/dev/null
     note "[$REPO_NAME] added"
 fi
@@ -159,7 +159,7 @@ fi
 # of it without installing anything. That leaves the packages in the cache to be
 # checked before they are applied, without ever having touched the system.
 say "Refreshing databases and downloading (full system upgrade)"
-$SUDO pacman -Syuw --noconfirm control-ofc-gui
+$SUDO pacman -Syuw --noconfirm ventulus
 
 # Sigstore build provenance is an EXTRA check on top of the GPG signature pacman
 # already enforces. It proves the bytes came from the source project's release
@@ -194,16 +194,16 @@ fi
 
 # `-Su` (no `-y`: the databases were refreshed moments ago) applies the same full
 # upgrade that was just downloaded, with our target in the SAME transaction — so
-# there is no window in which control-ofc is installed against an un-upgraded
+# there is no window in which Ventulus is installed against an un-upgraded
 # system. Everything needed is already cached, so this does not re-download.
 #
 # Deliberately INTERACTIVE. This is the only step that changes the system, it may
-# upgrade far more than control-ofc, and the user should see that transaction and
+# upgrade far more than Ventulus, and the user should see that transaction and
 # agree to it. That makes the script unsuitable for unattended use, which is the
 # intended trade.
 say "Installing"
 note "pacman will list the full transaction and ask you to confirm it."
-$SUDO pacman -Su --needed control-ofc-gui
+$SUDO pacman -Su --needed ventulus
 
 # ---------------------------------------------------------------------------
 # 4. Start the daemon
@@ -211,15 +211,15 @@ $SUDO pacman -Su --needed control-ofc-gui
 # The GUI talks to the daemon over a Unix socket and does nothing useful without
 # it. Skipping this is the single most common "it installed but does not work".
 say "Enabling the daemon"
-if systemctl is-enabled --quiet control-ofc-daemon 2>/dev/null \
-&& systemctl is-active --quiet control-ofc-daemon 2>/dev/null; then
-    note "control-ofc-daemon is already enabled and running"
+if systemctl is-enabled --quiet ventulusd 2>/dev/null \
+&& systemctl is-active --quiet ventulusd 2>/dev/null; then
+    note "ventulusd is already enabled and running"
 else
-    $SUDO systemctl enable --now control-ofc-daemon
-    note "control-ofc-daemon enabled and started"
+    $SUDO systemctl enable --now ventulusd
+    note "ventulusd enabled and started"
 fi
 
 say "Done"
-note "Launch the GUI with:  control-ofc-gui"
-note "Try it without hardware:  control-ofc-gui --demo"
+note "Launch the GUI with:  ventulus"
+note "Try it without hardware:  ventulus --demo"
 note "Upgrades from now on:  sudo pacman -Syu"
