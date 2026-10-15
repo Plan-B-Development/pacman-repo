@@ -22,10 +22,11 @@ Download it, check its signature, read it, then run it. Deliberately **not** a
 package that runs as a system service, which is not something to pipe unseen
 into a shell.
 
+Every command on this page works as written in bash, zsh and fish.
+
 ```bash
-base=https://github.com/Plan-B-Development/pacman-repo/releases/download/repo
-curl -fsSLO "$base/bootstrap.sh"
-curl -fsSLO "$base/bootstrap.sh.sig"
+curl -fsSLO https://github.com/Plan-B-Development/pacman-repo/releases/download/repo/bootstrap.sh
+curl -fsSLO https://github.com/Plan-B-Development/pacman-repo/releases/download/repo/bootstrap.sh.sig
 
 # Verify it was signed by this repository's release key
 curl -fsSL https://raw.githubusercontent.com/Plan-B-Development/pacman-repo/main/keys/ventulus.gpg | gpg --import
@@ -47,7 +48,14 @@ less bootstrap.sh
 bash ./bootstrap.sh
 ```
 
-It trusts the signing key (verifying the fingerprint first), adds the
+It first prints what it detected — distribution, CPU architecture, init system,
+pacman — and stops with exit status 3, having changed nothing, on a machine the
+packages cannot work on: a distribution not built on Arch, Manjaro (the GUI
+package installs into the Python version current Arch ships, and Manjaro's can lag
+behind it), a CPU other than x86_64, a system not booted with systemd, or one
+without pacman (or without sudo, when not run as root).
+
+Otherwise it trusts the signing key (verifying the fingerprint first), adds the
 repository, installs both packages, and enables the daemon. Re-running it is
 safe — every step checks its own end state, so an interrupted run can just be
 run again.
@@ -70,19 +78,16 @@ sudo pacman-key --lsign-key 4AAD6D2DE40D0D10773BF770BC27C5EB2831FCDA
 
 #### 2. Add the repository
 
-> **Run this once.** `tee -a` appends, so running it a second time adds a
-> duplicate `[ventulus]` block and pacman then warns about a redefined
-> repository. Check first with `grep -n '^\[ventulus\]' /etc/pacman.conf` — if
-> the block is already there, edit it instead of appending, or use Option A,
-> which handles this for you.
+> The `grep -q` guard makes this append nothing when a `[ventulus]` block is
+> already there, so a second run does not duplicate it. It also does not
+> correct an existing block that is wrong; edit that by hand, or use Option A,
+> which checks and rewrites it for you.
 
 ```bash
-grep -q '^\[ventulus\]' /etc/pacman.conf || sudo tee -a /etc/pacman.conf <<'EOF'
-
-[ventulus]
-SigLevel = Required
-Server = https://github.com/Plan-B-Development/pacman-repo/releases/download/repo
-EOF
+grep -q '^\[ventulus\]' /etc/pacman.conf || printf '%s\n' '' '[ventulus]' \
+  'SigLevel = Required' \
+  'Server = https://github.com/Plan-B-Development/pacman-repo/releases/download/repo' \
+  | sudo tee -a /etc/pacman.conf
 ```
 
 #### 3. Install
@@ -152,7 +157,7 @@ install needs nothing from here:
 ```bash
 gh release download --repo Plan-B-Development/ventulusd --pattern '*.pkg.tar.zst'
 gh release download --repo Plan-B-Development/ventulus  --pattern '*.pkg.tar.zst'
-sudo pacman -U ./ventulusd-*.pkg.tar.zst ./ventulus-[0-9]*.pkg.tar.zst
+sudo pacman -U ./ventulusd-*.pkg.tar.zst ./ventulus-*-any.pkg.tar.zst
 ```
 
 Upgrading then means repeating those commands. That is the trade this repository
@@ -187,7 +192,9 @@ metadata call. It is *effectively* atomic, not atomic — GitHub has no
 transaction across release assets.
 
 `verify.yml` then installs from the published result in a clean Arch container
-using the exact commands above, and runs daily on a schedule — because this
+using the exact commands above, checks that `bootstrap.sh` refuses the machines
+it should, and parses every command on this page in bash, zsh and fish. It runs
+daily on a schedule — because this
 repository can break with nobody touching it (expired key, deleted asset), and
 the alternative discovery mechanism is a user's `pacman -Syu` failing.
 

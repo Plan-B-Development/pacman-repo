@@ -236,9 +236,14 @@ jobs:
       #
       # /usr/local/bin precedes /usr/bin, and the script runs as root so its
       # $SUDO is empty — meaning these shims are what it actually calls.
+      #
+      # The script refuses a machine not booted with systemd, and tests that by
+      # /run/systemd/system, which a container lacks. Creating it is the third
+      # piece of driving from outside; `bootstrap-refuses` covers the refusal.
       - name: Install non-interactive shims
         run: |
           set -euo pipefail
+          mkdir -p /run/systemd/system
           cat > /usr/local/bin/pacman <<'SHIM'
           #!/bin/sh
           exec /usr/bin/pacman "$@" --noconfirm
@@ -260,7 +265,9 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x ./bootstrap.sh
-          ./bootstrap.sh
+          ./bootstrap.sh | tee /tmp/bootstrap.out
+          grep -q 'supported — continuing' /tmp/bootstrap.out \
+            || { echo "::error::bootstrap.sh did not report Arch x86_64 with systemd as supported"; exit 1; }
 
       - name: Both packages are actually installed
         run: |
@@ -284,6 +291,122 @@ jobs:
           [ "$n" -eq 1 ] \
             || { echo "::error::[ventulus] appears $n times in pacman.conf after two runs"; exit 1; }
           echo "ok: pacman.conf still has exactly one [ventulus] section"
+
+  # bootstrap.sh must stop, with exit status 3 and nothing changed, on a machine
+  # the packages cannot work on (DEC-498). Each case fakes one property of an
+  # Arch container — its os-release, its CPU, its init system — so the refusal
+  # under test is the only thing that can stop the script.
+  bootstrap-refuses:
+    name: bootstrap.sh refuses unsupported machines
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install fish
+        run: pacman -Syu --noconfirm --needed fish
+
+      - name: Each unsupported machine is refused, with nothing changed
+        run: |
+          set -euo pipefail
+          cp /etc/pacman.conf /tmp/pacman.conf.orig
+          mkdir -p /run/systemd/system
+
+          expect_refusal() {  # expect_refusal <label> <expected text> <command...>
+            label=$1 want=$2
+            shift 2
+            rc=0
+            "$@" > /tmp/out.txt 2>&1 || rc=$?
+            cat /tmp/out.txt
+            [ "$rc" -eq 3 ] \
+              || { echo "::error::$label: exit status $rc, expected 3 (refused)"; exit 1; }
+            grep -qF -- "$want" /tmp/out.txt \
+              || { echo "::error::$label: the output does not say: $want"; exit 1; }
+            grep -qF 'Nothing was changed.' /tmp/out.txt \
+              || { echo "::error::$label: the output does not say nothing was changed"; exit 1; }
+            cmp -s /etc/pacman.conf /tmp/pacman.conf.orig \
+              || { echo "::error::$label: /etc/pacman.conf was modified"; exit 1; }
+            [ ! -e /etc/pacman.conf.ventulus.bak ] \
+              || { echo "::error::$label: a pacman.conf backup was written"; exit 1; }
+            echo "ok: $label refused"
+          }
+          # /etc/os-release is a symlink into /usr/lib; replace the link, not its target.
+          os() { rm -f /etc/os-release; printf '%s\n' "$@" > /etc/os-release; }
+
+          os 'NAME="Manjaro Linux"' 'ID=manjaro' 'ID_LIKE=arch' 'PRETTY_NAME="Manjaro Linux"'
+          expect_refusal Manjaro 'Manjaro is not supported.' bash ./bootstrap.sh
+          # The documented launch from fish, CachyOS's default shell.
+          expect_refusal 'Manjaro, launched from fish' 'Manjaro is not supported.' \
+            fish -c 'bash ./bootstrap.sh'
+
+          os 'NAME="Debian GNU/Linux"' 'ID=debian' 'PRETTY_NAME="Debian GNU/Linux 13 (trixie)"'
+          expect_refusal Debian 'Debian GNU/Linux 13 (trixie) is not supported.' bash ./bootstrap.sh
+
+          os 'NAME=Ubuntu' 'ID=ubuntu' 'ID_LIKE=debian' 'PRETTY_NAME="Ubuntu 26.04 LTS"'
+          expect_refusal Ubuntu 'Ubuntu 26.04 LTS is not supported.' bash ./bootstrap.sh
+
+          os 'NAME="Fedora Linux"' 'ID=fedora' 'PRETTY_NAME="Fedora Linux 43 (Workstation Edition)"'
+          expect_refusal Fedora 'Fedora Linux 43 (Workstation Edition) is not supported.' bash ./bootstrap.sh
+
+          # Arch from here on, each with one machine property wrong.
+          printf '#!/bin/sh\necho aarch64\n' > /usr/local/bin/uname
+          chmod +x /usr/local/bin/uname
+          # An Arch derivative with no ID_LIKE line (some Garuda releases) must
+          # pass the distribution check: refused for the CPU, never for the distro.
+          os 'NAME="Garuda Linux"' 'ID=garuda' 'PRETTY_NAME="Garuda Linux"'
+          expect_refusal 'Garuda (no ID_LIKE) on aarch64' 'built for x86_64 only' bash ./bootstrap.sh
+          ! grep -qF 'is not supported' /tmp/out.txt \
+            || { echo "::error::Garuda without ID_LIKE was refused as a distribution"; exit 1; }
+          os 'NAME="Arch Linux"' 'ID=arch' 'PRETTY_NAME="Arch Linux"'
+          expect_refusal 'Arch on aarch64' 'built for x86_64 only' bash ./bootstrap.sh
+          rm /usr/local/bin/uname
+
+          rmdir /run/systemd/system
+          expect_refusal 'Arch without systemd' 'not booted with systemd' bash ./bootstrap.sh
+
+  # The README's commands are pasted into whatever shell the user runs. CachyOS
+  # defaults to fish, where a heredoc, a `NAME=value` line or a bracketed
+  # `(cd … && …)` is a parse error, and the install steps carried all three until
+  # 2026-10-15 because nothing ran them in anything but bash.
+  lint:
+    name: bootstrap.sh lints; README commands parse in bash, zsh and fish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the shells and shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fish zsh shellcheck
+
+      # Warning level: the one info-level note (SC2012, `ls -t` to pick the newest
+      # cached package) is a deliberate, commented choice.
+      - name: shellcheck bootstrap.sh
+        run: shellcheck --severity=warning bootstrap.sh
+
+      - name: Every README command block parses in every shell
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/blocks
+          awk '
+            /^```bash$/ { n++; file = sprintf("/tmp/blocks/%02d.sh", n); inside = 1; next }
+            /^```$/     { inside = 0; next }
+            inside      { print > file }
+          ' README.md
+          count=$(find /tmp/blocks -name '*.sh' | wc -l)
+          [ "$count" -ge 5 ] \
+            || { echo "::error::found only $count bash blocks in README.md — has the fence format changed?"; exit 1; }
+          fail=0
+          for f in /tmp/blocks/*.sh; do
+            bash -n "$f"            || { echo "::error::README.md bash block $(basename "$f") does not parse in bash"; fail=1; }
+            zsh -n "$f"             || { echo "::error::README.md bash block $(basename "$f") does not parse in zsh"; fail=1; }
+            fish --no-execute "$f"  || { echo "::error::README.md bash block $(basename "$f") does not parse in fish"; fail=1; }
+          done
+          [ "$fail" -eq 0 ] && echo "ok: all $count README.md command blocks parse in bash, zsh and fish"
+          exit "$fail"
 
   # The signing-key fingerprint is pinned in five places across this repo. Nothing
   # compared them, so a key rotation would have to be caught by hand in all five

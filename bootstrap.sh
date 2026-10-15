@@ -19,10 +19,12 @@
 # particular it will not append a second [ventulus] block to pacman.conf —
 # the copy-pasteable `tee -a` in the old README did exactly that on a re-run.
 #
-# It assumes a working Arch x86_64 system. There is deliberately no distro or
-# architecture check: if you are somewhere else, the first step that cannot work
-# fails with its own tool's error message, which says more than a guess of ours
-# would.
+# CHECKS THE MACHINE FIRST. Step 0 prints what it detected — distribution,
+# architecture, init system, pacman — and stops, having changed nothing, on a
+# machine the packages cannot work on: a distribution not built on Arch, Manjaro,
+# a CPU other than x86_64, a system not booted with systemd, or one missing
+# pacman (or sudo, when not run as root). A refusal exits
+# with status 3, so a caller can tell it from a step that failed (status 1).
 #
 # Verify this script before running it — see README.md § Install.
 
@@ -44,6 +46,105 @@ fi
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
 die()  { printf '\n\033[1;31m==> %s\033[0m\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# 0. Check this machine can take the packages
+# ---------------------------------------------------------------------------
+# Runs before anything is downloaded or changed, so a refusal leaves the system
+# exactly as it was. Without it, a Debian or Fedora user got as far as
+# `pacman-key: command not found`, and a Manjaro user got a GUI package
+# installed into a Python version their system may not have yet.
+say "Checking this machine"
+
+os_release=''
+for f in /etc/os-release /usr/lib/os-release; do
+    if [ -r "$f" ]; then
+        os_release="$f"
+        break
+    fi
+done
+
+os_field() {
+    # Print one os-release field with its quotes removed. The file is parsed,
+    # never sourced: sourcing it would run its contents as code, as root.
+    [ -n "$os_release" ] || return 0
+    awk -v key="$1" -v q="'" '
+        index($0, key "=") == 1 {
+            v = substr($0, length(key) + 2)
+            gsub("^[\"" q "]|[\"" q "]$", "", v)
+            print v
+            exit
+        }
+    ' "$os_release"
+}
+
+os_id="$(os_field ID)"
+os_like="$(os_field ID_LIKE)"
+os_name="$(os_field PRETTY_NAME)"
+os_name="${os_name:-${os_id:-unknown (no os-release file)}}"
+machine="$(uname -m)"
+pacman_bin="$(command -v pacman || true)"
+# /run/systemd/system exists only when systemd is PID 1 — the test sd_booted(3)
+# itself uses. Having the systemctl binary is not enough: a container or a
+# chroot has it too, and `systemctl enable --now` would not start anything.
+if [ -d /run/systemd/system ]; then
+    init='systemd'
+else
+    init="not systemd (PID 1 is $(cat /proc/1/comm 2>/dev/null || echo unknown))"
+fi
+
+note "distribution:  $os_name (ID=${os_id:-none}${os_like:+, ID_LIKE=$os_like})"
+note "architecture:  $machine"
+note "init system:   $init"
+note "pacman:        ${pacman_bin:-not found}"
+
+# Word match against ID and ID_LIKE together: Arch itself has no ID_LIKE, and
+# its derivatives normally carry ID_LIKE=arch. The derivatives named in the
+# docs are also accepted by ID alone, because some releases (Garuda's, by its
+# own forum) have shipped an os-release with no ID_LIKE line at all.
+family=" $os_id $os_like "
+
+refuse() {
+    printf '\n\033[1;31m==> %s\033[0m\n' "$1" >&2
+    shift
+    printf '    %s\n' "$@" >&2
+    printf '\n    Nothing was changed.\n' >&2
+    exit 3
+}
+
+case "$family" in
+    *" manjaro "*)
+        refuse "Manjaro is not supported." \
+            "Manjaro holds packages back behind Arch, and the Ventulus packages" \
+            "are built against current Arch. The GUI installs into the Python" \
+            "version Arch ships, so whenever Manjaro's Python is a different" \
+            "version the GUI cannot start." ;;
+    *" arch "*|*" cachyos "*|*" endeavouros "*|*" garuda "*)
+        ;;
+    *)
+        refuse "$os_name is not supported." \
+            "Ventulus is packaged only for Arch Linux and the distributions built" \
+            "on it, such as CachyOS, EndeavourOS and Garuda. There are no .deb or" \
+            ".rpm packages. The source is at" \
+            "https://github.com/Plan-B-Development/ventulusd and" \
+            "https://github.com/Plan-B-Development/ventulus; building it yourself" \
+            "on another distribution is possible but unsupported." ;;
+esac
+
+problems=()
+[ "$machine" = 'x86_64' ] \
+    || problems+=("The daemon is built for x86_64 only, and this machine is $machine.")
+[ "$init" = 'systemd' ] \
+    || problems+=("The daemon runs as a systemd service, and this system was not booted with systemd.")
+[ -n "$pacman_bin" ] \
+    || problems+=("pacman was not found.")
+if [ -n "$SUDO" ] && ! command -v sudo >/dev/null 2>&1; then
+    problems+=("sudo was not found. Install it, or run this script as root.")
+fi
+if [ "${#problems[@]}" -gt 0 ]; then
+    refuse "This machine cannot run the Ventulus packages." "${problems[@]}"
+fi
+note "supported — continuing"
 
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
