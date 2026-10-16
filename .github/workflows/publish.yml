@@ -35,6 +35,7 @@ name: Publish package repositories
 #   fetch, images (no key) -> pacman, apt, dnf, manifest (sign; build artifacts only)
 #   -> release (pacman + APT onto the `repo` release; no key)
 #   -> pages (DNF + manifest, one atomic deployment)
+#   -> prune (superseded `repo` assets, once no stale index can name them; no key)
 # Pages deploys only after the release assets are live, so the manifest never
 # announces a version that pacman or APT does not serve yet.
 #
@@ -380,6 +381,8 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
+    outputs:
+      swapped_at: ${{ steps.publish.outputs.swapped_at }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -394,6 +397,7 @@ jobs:
           path: build
 
       - name: Publish the repository
+        id: publish
         run: |
           set -euo pipefail
           keys=()
@@ -427,7 +431,8 @@ jobs:
           # not already uploaded, so:
           #   1. packages + signatures first  (referenced-by, must exist first)
           #   2. indices staged under temp names, then swapped in by RENAME
-          #   3. prune superseded assets last (nothing points at them any more)
+          #   3. prune superseded assets last, in the `prune` job, once no
+          #      client can still be served an index that names them
           #
           # Package filenames carry the version, so a new release adds new asset
           # names rather than replacing any — the old packages stay downloadable
@@ -435,12 +440,15 @@ jobs:
           # once the new indices have already stopped referencing them.
           #
           # GitHub serves a REPLACED asset stale for about 90–150 s per URL once
-          # that URL has been fetched (DEC-499 phase 0), which no order here can
-          # avoid: in that window apt can pair a new InRelease with an old
-          # Packages (a hash mismatch; apt keeps its previous lists and the next
-          # `apt update` succeeds), and an old index can name a package the prune
-          # removed. The user accepted that window; README documents it and
-          # verify.yml waits it out.
+          # that URL has been fetched (DEC-499 phase 0; PKG-h measured ~115 s on
+          # ventulus.db), which no order here can avoid: in that window apt can
+          # pair a new InRelease with an old Packages (a hash mismatch; apt keeps
+          # its previous lists and the next `apt update` succeeds), and as each
+          # URL flips, pacman can get a new database with its old signature for
+          # a second or two (refused; the next `pacman -Sy` succeeds). The user
+          # accepted that window; README documents it and verify.yml waits it
+          # out. What the window must not do is serve an old index naming a
+          # package that is gone, which is why the prune waits.
           gh release upload "$REPO_TAG" --clobber \
             ./*.pkg.tar.zst ./*.pkg.tar.zst.sig ./*.deb \
             "${keys[@]}" bootstrap.sh bootstrap.sh.sig
@@ -501,29 +509,32 @@ jobs:
           for f in "${indices[@]}"; do
             swap "$f"
           done
+          echo "swapped_at=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+          # `<name> <asset API URL, which carries its id>` for every index,
+          # sorted; `prune` runs the same query.
+          live_indices() {
+            local names
+            names=$(printf '%s\n' "${indices[@]}" | jq -R . | jq -s -c .)
+            gh release view "$REPO_TAG" --json assets \
+              -q ".assets[] | select(.name | IN(${names}[])) | \"\(.name) \(.apiUrl)\"" \
+              | sort
+          }
 
           # Retitle a release created under an older name; a no-op once it matches.
           gh release edit "$REPO_TAG" --title "Ventulus package repositories" >/dev/null
 
-          # Prune superseded assets, LAST — by this point the freshly-swapped
-          # indices no longer reference any of them, so removing them cannot
-          # break an in-flight upgrade that already read the new indices.
-          # Without this every past version accumulates on the release forever:
-          # inert, but unbounded, and it reads as though several versions are on
-          # offer.
-          #
-          # `.staging` names are deliberately excluded from the keep list. In the
-          # normal path they no longer exist (they were renamed), but a run that
-          # died mid-swap leaves one behind — excluding them here makes the next
-          # successful publish self-healing.
-          find . -maxdepth 1 -type f ! -name '*.staging' -printf '%f\n' > "$RUNNER_TEMP/keep.txt"
-          gh release view "$REPO_TAG" --json assets -q '.assets[].name' \
-            | while read -r asset; do
-                if ! grep -qxF "$asset" "$RUNNER_TEMP/keep.txt"; then
-                  echo "pruning superseded asset: $asset"
-                  gh release delete-asset "$REPO_TAG" "$asset" --yes
-                fi
-              done
+          # What this publish serves, for the `prune` job. `.staging` names are
+          # deliberately left out. In the normal path they no longer exist (they
+          # were renamed), but a run that died mid-swap leaves one behind —
+          # leaving them out of the keep list makes the next successful publish
+          # self-healing.
+          mkdir -p "$RUNNER_TEMP/keep"
+          find . -maxdepth 1 -type f ! -name '*.staging' -printf '%f\n' | sort > "$RUNNER_TEMP/keep/keep.txt"
+          # The asset behind each index this run swapped in. An asset's id
+          # changes whenever it is replaced, so `prune` can tell that these
+          # indices are still the live ones.
+          live_indices > "$RUNNER_TEMP/keep/indices.txt"
 
           {
             echo "### Published on the repo release"
@@ -531,6 +542,13 @@ jobs:
               echo "- \`$pkg\`"
             done
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: keep
+          path: ${{ runner.temp }}/keep/
+          if-no-files-found: error
+          retention-days: 3
 
   # One deployment replaces the whole site, so the DNF metadata, its packages
   # and the manifest with its signature change together. Needs Pages enabled
@@ -569,3 +587,69 @@ jobs:
           path: site
       - id: deploy
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+  # Prune superseded assets, LAST, and late. The swapped-in indices stop naming
+  # them at once, but GitHub keeps serving each replaced index stale for up to
+  # ~150 s (PKG-h measured ~115 s on ventulus.db), and an old index names the
+  # old packages: pruning straight after the swap made every version bump a
+  # 404 for anyone syncing in that window. So this waits until PRUNE_AFTER
+  # seconds past the last swap. If `pages` failed, it does not run: the old
+  # assets stay, inert, and the next successful publish prunes them.
+  # Without a prune every past version accumulates on the release forever:
+  # inert, but unbounded, and it reads as though several versions are on offer.
+  #
+  # The keep list describes THIS run's indices only. "Re-run failed jobs"
+  # replays this job with the original run's outputs and artifacts, possibly
+  # after a later publish served new packages that list never named, so it
+  # deletes nothing unless every index this run swapped in is still the live
+  # asset (same asset id). Otherwise the later run's own prune owns the cleanup.
+  #
+  # continue-on-error: a failed prune leaves only inert assets the next publish
+  # removes, and must not mark the run failed, because verify.yml skips its
+  # install checks after a failed publish. Holds no key.
+  prune:
+    name: Prune superseded assets from the repo release
+    needs: [release, pages]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SWAPPED_AT: ${{ needs.release.outputs.swapped_at }}
+      # Twice the longest stale window measured.
+      PRUNE_AFTER: 300
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: keep
+          path: keep
+
+      - name: Prune
+        run: |
+          set -euo pipefail
+          [[ "$SWAPPED_AT" =~ ^[0-9]+$ ]] \
+            || { echo "::error::release did not report when it swapped the indices"; exit 1; }
+          [ -s keep/keep.txt ] || { echo "::error::the keep list is empty"; exit 1; }
+          [ -s keep/indices.txt ] || { echo "::error::the index list is empty"; exit 1; }
+          wait=$((SWAPPED_AT + PRUNE_AFTER - $(date +%s)))
+          if [ "$wait" -gt 0 ]; then
+            echo "waiting ${wait}s for every stale index to expire"
+            sleep "$wait"
+          fi
+          names=$(cut -d' ' -f1 keep/indices.txt | jq -R . | jq -s -c .)
+          live=$(gh release view "$REPO_TAG" --json assets \
+                   -q ".assets[] | select(.name | IN(${names}[])) | \"\(.name) \(.apiUrl)\"" \
+                 | sort)
+          if [ "$live" != "$(cat keep/indices.txt)" ]; then
+            echo "::notice::the live indices are not the ones this run swapped in (a later publish replaced them); pruning nothing"
+            exit 0
+          fi
+          gh release view "$REPO_TAG" --json assets -q '.assets[].name' \
+            | while read -r asset; do
+                if ! grep -qxF "$asset" keep/keep.txt; then
+                  echo "pruning superseded asset: $asset"
+                  gh release delete-asset "$REPO_TAG" "$asset" --yes
+                fi
+              done

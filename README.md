@@ -129,6 +129,13 @@ sudo pacman -Syu
 
 That's it. There is nothing to re-run and nothing to re-download by hand.
 
+For about two minutes after a new release is published, `pacman -Syu` can stop
+with `invalid or corrupted database (PGP signature)` for this repository:
+GitHub keeps serving the replaced database and its signature from its cache for
+a while, and for a moment one can be new while the other is still old. pacman
+refuses the pair and upgrades nothing. Run `sudo pacman -Syu` again a few
+minutes later.
+
 ### Removing
 
 ```bash
@@ -338,8 +345,10 @@ is always safe and there is no accumulated state to drift.
 5. write and sign `ventulus-updates.json`
 6. upload pacman and APT to the `repo` release in a **deliberate order**:
    packages and their signatures first, then the indexes staged under temporary
-   names and swapped in by rename, then old packages pruned
-7. deploy DNF and the manifest to GitHub Pages in one deployment, last
+   names and swapped in by rename
+7. deploy DNF and the manifest to GitHub Pages in one deployment
+8. prune the superseded packages from the `repo` release, no sooner than five
+   minutes after the swap
 
 Step 6's ordering is the part that is easy to get wrong. The indexes are the
 pointers, so they must land *last* — nothing may reference a package that is
@@ -352,7 +361,9 @@ that window to a metadata call. It is *effectively* atomic, not atomic — GitHu
 has no transaction across release assets, and it serves a replaced asset from
 cache for a while (the window described under [Debian and Ubuntu](#debian-and-ubuntu)).
 Pages is deployed after the release, so the manifest never announces a version
-pacman and APT do not serve yet.
+pacman and APT do not serve yet. The prune waits out that cache: an old index
+still being served names the old packages, so deleting them straight after the
+swap would turn every upgrade in those two minutes into a 404.
 
 `verify.yml` then installs from the published result in clean Arch, Debian 13,
 Ubuntu 26.04, Fedora 44 and Fedora 45 containers using the commands above, checks the
