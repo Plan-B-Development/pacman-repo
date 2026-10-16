@@ -271,13 +271,33 @@ The packages are also attached to every upstream GitHub Release (`.pkg.tar.zst`,
 `.deb`, `.rpm` and a tarball), so a one-off install needs nothing from here:
 
 ```bash
+# Arch
 gh release download --repo Plan-B-Development/ventulusd --pattern '*.pkg.tar.zst'
 gh release download --repo Plan-B-Development/ventulus  --pattern '*.pkg.tar.zst'
 sudo pacman -U ./ventulusd-*.pkg.tar.zst ./ventulus-*-any.pkg.tar.zst
 ```
 
-Upgrading then means repeating those commands. That is the trade the
-repositories exist to remove.
+```bash
+# Debian 13, Ubuntu 26.04
+gh release download --repo Plan-B-Development/ventulusd --pattern '*.deb'
+gh release download --repo Plan-B-Development/ventulus  --pattern '*.deb'
+sudo apt install ./ventulusd_*_amd64.deb ./ventulus_*_all.deb
+```
+
+```bash
+# Fedora 44
+gh release download --repo Plan-B-Development/ventulusd --pattern '*.rpm'
+gh release download --repo Plan-B-Development/ventulus  --pattern '*.rpm'
+sudo dnf install ./ventulusd-*.x86_64.rpm ./ventulus-*.fc44.noarch.rpm
+```
+
+The tarballs (`ventulusd-X.Y.Z-x86_64.tar.gz`, `ventulus-X.Y.Z-noarch.tar.gz`)
+install on Debian 13, Ubuntu 26.04 and Fedora 44 without a package manager; the
+GUI's [Getting Started](https://github.com/Plan-B-Development/ventulus/blob/main/manual/getting-started.md#the-tarball)
+has the steps, and the GUI's update check can download and verify a new one.
+
+Upgrading a release install means repeating those commands. That is the trade
+the repositories exist to remove.
 
 ---
 
