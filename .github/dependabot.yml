@@ -1,13 +1,19 @@
 version: 2
 
-# Scope is deliberately GitHub Actions ONLY — this repo has no application
-# dependencies, only workflows.
+# Scope is deliberately the workflows ONLY — this repo has no application
+# dependencies: the actions they use, and the container images publish.yml's
+# signing jobs run in.
 #
 # It matters more here than in the two source repos: publish.yml is the most
 # security-critical workflow in the project. It verifies release provenance with
 # `gh attestation verify` and then signs the pacman database with the project GPG
 # key, so a stale or compromised action in this repo sits directly on the signing
 # path. Every action is SHA-pinned; nothing was watching those pins.
+#
+# The images are digest-pinned in .github/images/<name>/Dockerfile, because the
+# docker updater reads a Dockerfile's FROM and never a workflow's `container:`
+# (publish.yml's `images` job carries each pin into its job). A bump PR changes
+# the environment the signing key is handed to: read it as such.
 updates:
   - package-ecosystem: github-actions
     directory: /
@@ -18,5 +24,18 @@ updates:
       prefix: "ci"
     groups:
       actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: docker
+    directories:
+      - /.github/images/*
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "ci"
+    groups:
+      images:
         patterns:
           - "*"

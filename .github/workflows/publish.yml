@@ -32,7 +32,7 @@ name: Publish package repositories
 # Signing is downstream of verification, never a substitute for it.
 #
 # Job order is the publication order:
-#   fetch (no key) -> pacman, apt, dnf, manifest (sign; build artifacts only)
+#   fetch, images (no key) -> pacman, apt, dnf, manifest (sign; build artifacts only)
 #   -> release (pacman + APT onto the `repo` release; no key)
 #   -> pages (DNF + manifest, one atomic deployment)
 # Pages deploys only after the release assets are live, so the manifest never
@@ -108,14 +108,41 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+  # The containers the key-holding jobs run in, pinned by digest. A mutable tag
+  # would let whoever can push that tag choose the environment the passphrase
+  # and private key are handed to. Each pin lives in .github/images/<name>/Dockerfile
+  # because Dependabot's docker updater bumps a FROM digest but never reads a
+  # workflow's `container:`; `container:` cannot read a file, so this job does.
+  # A FROM line that is not exactly `name:tag@sha256:<64 hex>` fails the run
+  # before any key is used.
+  images:
+    name: Read the pinned images
+    runs-on: ubuntu-latest
+    outputs:
+      archlinux: ${{ steps.pin.outputs.archlinux }}
+      debian: ${{ steps.pin.outputs.debian }}
+      fedora: ${{ steps.pin.outputs.fedora }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - id: pin
+        run: bash .github/scripts/images.sh
+
   pacman:
     name: Build the pacman repository
-    needs: fetch
+    needs: [fetch, images]
     runs-on: ubuntu-latest
-    container: archlinux:latest
+    container: ${{ needs.images.outputs.archlinux }}
     steps:
+      # The keyring first: a pinned image is weeks old, and packages signed by
+      # a packager key added since would fail `-Syu` as unknown trust. The new
+      # keyring is itself signed by keys the image already trusts.
       - name: Install tooling
-        run: pacman -Syu --noconfirm --needed pacman-contrib
+        run: |
+          set -euo pipefail
+          pacman -Sy --noconfirm --needed archlinux-keyring
+          pacman -Su --noconfirm --needed pacman-contrib
 
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -241,9 +268,9 @@ jobs:
 
   apt:
     name: Build the APT repository
-    needs: fetch
+    needs: [fetch, images]
     runs-on: ubuntu-latest
-    container: debian:13
+    container: ${{ needs.images.outputs.debian }}
     steps:
       - name: Install tooling
         run: |
@@ -276,9 +303,9 @@ jobs:
 
   dnf:
     name: Build the DNF repositories
-    needs: fetch
+    needs: [fetch, images]
     runs-on: ubuntu-latest
-    container: fedora:44
+    container: ${{ needs.images.outputs.fedora }}
     steps:
       - name: Install tooling
         run: dnf -y -q install rpm-sign createrepo_c gnupg2
@@ -309,9 +336,9 @@ jobs:
 
   manifest:
     name: Build the update manifest
-    needs: fetch
+    needs: [fetch, images]
     runs-on: ubuntu-latest
-    container: debian:13
+    container: ${{ needs.images.outputs.debian }}
     steps:
       - name: Install tooling
         run: |
