@@ -1,19 +1,21 @@
 name: Verify install path
 
-# Proves the published repository actually works, from a clean machine, using
-# exactly the commands README.md gives users. Nothing else in this project tests
-# the thing users actually do — a broken database, an unsigned package, a
-# symlinked .db, or an untrusted key all produce a perfectly green publish run
-# and a repository nobody can install from.
+# Proves the published repositories actually work, from a clean machine, using
+# exactly the commands README.md gives users: pacman on Arch (and bootstrap.sh),
+# APT on Debian 13 and Ubuntu 26.04, DNF on Fedora 44, and the signed update
+# manifest. Nothing else in this project tests the thing users actually do — a
+# broken database, an unsigned package, a symlinked .db, or an untrusted key all
+# produce a perfectly green publish run and a repository nobody can install from.
 #
-# Runs after every publish, and on a daily schedule. The schedule matters: this
-# repository can break without anyone touching it (an expired signing key, a
+# Runs after every publish, and on a daily schedule. The schedule matters: these
+# repositories can break without anyone touching them (an expired signing key, a
 # deleted release asset, a GitHub storage change), and the failure would
-# otherwise first surface as a user's `pacman -Syu` breaking.
+# otherwise first surface as a user's upgrade breaking. Every leg also fails when
+# what it is served is not the latest Release: the staleness alarm.
 
 on:
   workflow_run:
-    workflows: [Publish pacman repository]
+    workflows: [Publish package repositories]
     types: [completed]
   workflow_dispatch:
   schedule:
@@ -23,7 +25,7 @@ on:
 permissions:
   contents: read
 
-# Deliberately the SAME group as `Publish pacman repository`, so verification can
+# Deliberately the SAME group as `Publish package repositories`, so verification can
 # never run while a publish is rewriting the release assets. `gh release upload
 # --clobber` deletes an asset before re-uploading it, so during a publish the
 # database and its signature genuinely 404 for a moment. Observed 2026-08-05: a
@@ -52,8 +54,286 @@ env:
   # agree, so ending the [control-ofc] alias in one place cannot leave this
   # workflow red against a database that was meant to be gone.
   SECTIONS: ventulus control-ofc
+  APT_URI: https://github.com/Plan-B-Development/pacman-repo/releases/download/repo/
+  PAGES_URL: https://plan-b-development.github.io/pacman-repo
+  KEY_URL: https://raw.githubusercontent.com/Plan-B-Development/pacman-repo/main/keys/ventulus.gpg
+  # GitHub serves a replaced release asset stale for ~90–150 s per URL (DEC-499
+  # phase 0), and Pages caches for up to 600 s. A leg chained straight off a
+  # publish polls until what it sees is consistent and current, for at most
+  # this long; on the daily schedule the first poll passes.
+  SETTLE_SECONDS: 900
 
 jobs:
+  # The latest stable Release of each project: what every leg must be serving.
+  upstream:
+    name: Latest upstream versions
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    outputs:
+      ventulusd: ${{ steps.v.outputs.ventulusd }}
+      ventulus: ${{ steps.v.outputs.ventulus }}
+    steps:
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for p in ventulusd ventulus; do
+            tag=$(gh release view --repo "Plan-B-Development/$p" --json tagName -q .tagName)
+            echo "$p=${tag#v}" | tee -a "$GITHUB_OUTPUT"
+          done
+
+  # README § Debian and Ubuntu, in a clean container of each supported release.
+  apt:
+    name: Clean-machine install (APT, ${{ matrix.image }})
+    needs: upstream
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['debian:13', 'ubuntu:26.04']
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      WANT_D: ${{ needs.upstream.outputs.ventulusd }}
+      WANT_G: ${{ needs.upstream.outputs.ventulus }}
+    steps:
+      - name: Trust the signing key as README says
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          apt-get install -y -qq ca-certificates curl gpg > /dev/null
+          install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL "$KEY_URL" | tee /etc/apt/keyrings/ventulus.asc > /dev/null
+          fpr=$(gpg --show-keys --with-colons /etc/apt/keyrings/ventulus.asc | awk -F: '/^fpr:/ {print $10; exit}')
+          [ "$fpr" = "$SIGNING_KEY" ] \
+            || { echo "::error::the key at $KEY_URL is $fpr, not $SIGNING_KEY"; exit 1; }
+
+      - name: Add the repository
+        run: |
+          set -euo pipefail
+          printf '%s\n' 'Types: deb' \
+            "URIs: $APT_URI" \
+            'Suites: ./' \
+            'Signed-By: /etc/apt/keyrings/ventulus.asc' \
+            | tee /etc/apt/sources.list.d/ventulus.sources
+
+      # Signed-By holds only the repository key, so a clean update is the
+      # InRelease signature verifying, and the Packages hashes matching it.
+      - name: apt update is clean and serves the latest Releases
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + SETTLE_SECONDS))
+          while :; do
+            if apt-get update > /tmp/update.log 2>&1 && ! grep -qE '^(W|E|Warning|Error):' /tmp/update.log; then
+              d=$(apt-cache policy ventulusd | awk '/Candidate:/ {print $2}')
+              g=$(apt-cache policy ventulus | awk '/Candidate:/ {print $2}')
+              [ "${d%-*}" = "$WANT_D" ] && [ "${g%-*}" = "$WANT_G" ] && break
+              why="it serves ventulusd ${d} and ventulus ${g}; the latest Releases are ${WANT_D} and ${WANT_G}"
+            else
+              why="apt-get update is not clean: $(grep -E '^(W|E|Warning|Error):' /tmp/update.log | head -3 | tr '\n' ' ')"
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              cat /tmp/update.log
+              echo "::error::after ${SETTLE_SECONDS}s, ${why}. A stale version means the publish workflow has not run for a release — check notify-repo in the source repo and the PACMAN_REPO_TOKEN secret."
+              exit 1
+            fi
+            echo "waiting: $why"
+            sleep 15
+          done
+          echo "ok: apt serves ventulusd $d and ventulus $g"
+
+      - name: Install the GUI, which pulls in the daemon
+        run: |
+          set -euo pipefail
+          apt-get install -y -q ventulus
+          for p in ventulus ventulusd; do
+            dpkg-query -W -f '${Package} ${Version} ${db:Status-Status}\n' "$p" | tee /tmp/q
+            grep -q ' installed$' /tmp/q || { echo "::error::$p is not installed"; exit 1; }
+          done
+          ventulusd --version
+
+  # README § Fedora, in a clean container of each Fedora release served. Add a
+  # release here when the GUI Release gains its .fcN.rpm.
+  dnf:
+    name: Clean-machine install (DNF, ${{ matrix.image }})
+    needs: upstream
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['fedora:44']
+    env:
+      WANT_D: ${{ needs.upstream.outputs.ventulusd }}
+      WANT_G: ${{ needs.upstream.outputs.ventulus }}
+    steps:
+      - name: Add the repository as README says
+        run: |
+          set -euo pipefail
+          command -v curl > /dev/null || dnf -y -q install curl
+          curl -fsSL "$PAGES_URL/ventulus.repo" | tee /etc/yum.repos.d/ventulus.repo
+          # Every check below rests on these lines; without them dnf would take
+          # unsigned metadata or packages and the install would still pass.
+          for line in gpgcheck=1 repo_gpgcheck=1 "gpgkey=$KEY_URL"; do
+            grep -qxF "$line" /etc/yum.repos.d/ventulus.repo \
+              || { echo "::error::the served ventulus.repo lacks '$line'"; exit 1; }
+          done
+
+      # The metadata signature, checked directly against the published key, not
+      # only through dnf's repo_gpgcheck.
+      - name: repomd.xml is signed by the repository key
+        run: |
+          set -euo pipefail
+          if ! command -v gpg > /dev/null || ! command -v gpgv > /dev/null; then
+            dnf -y -q install gnupg2 gnupg2-verify
+          fi
+          rel=$(rpm -E %fedora)
+          base="$PAGES_URL/rpm/fedora/$rel/x86_64/repodata"
+          curl -fsSL "$KEY_URL" | gpg --dearmor > /tmp/keyring.gpg
+          deadline=$((SECONDS + SETTLE_SECONDS))
+          while :; do
+            if curl -fsS -o /tmp/repomd.xml "$base/repomd.xml" && curl -fsS -o /tmp/repomd.xml.asc "$base/repomd.xml.asc"; then
+              signer=$(gpgv --status-fd 1 --keyring /tmp/keyring.gpg /tmp/repomd.xml.asc /tmp/repomd.xml 2>/dev/null \
+                         | awk '$2 == "VALIDSIG" {print $NF}' || true)
+              [ "$signer" = "$SIGNING_KEY" ] && break
+              why="repomd.xml.asc does not verify as $SIGNING_KEY"
+            else
+              why="repomd.xml or its signature is not served for Fedora $rel"
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::after ${SETTLE_SECONDS}s, ${why}"
+              exit 1
+            fi
+            echo "waiting: $why"
+            sleep 15
+          done
+          echo "ok: Fedora $rel repomd.xml verifies as $SIGNING_KEY"
+
+      # dnf5 rejects a bad repomd.xml signature only quietly: `makecache` prints
+      # the error and exits 0, and the metadata is discarded (DEC-499 phase 0).
+      # So this asks repoquery what the repository offers; with a bad signature
+      # it offers nothing.
+      - name: The signed metadata serves the latest Releases
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + SETTLE_SECONDS))
+          while :; do
+            # -y: the first metadata load imports the key, which asks first.
+            dnf -y -q --refresh --repo ventulus repoquery --latest-limit 1 \
+                --qf '%{name} %{version}\n' ventulusd ventulus < /dev/null > /tmp/offer.txt 2> /tmp/dnf.log || true
+            d=$(awk '$1 == "ventulusd" {print $2}' /tmp/offer.txt)
+            g=$(awk '$1 == "ventulus" {print $2}' /tmp/offer.txt)
+            [ "$d" = "$WANT_D" ] && [ "$g" = "$WANT_G" ] && break
+            why="the repository offers ventulusd '${d}' and ventulus '${g}'; the latest Releases are ${WANT_D} and ${WANT_G}"
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              cat /tmp/dnf.log
+              echo "::error::after ${SETTLE_SECONDS}s, ${why}. Nothing offered at all means the metadata was refused (check the signature lines above) or Pages is not deployed."
+              exit 1
+            fi
+            echo "waiting: $why"
+            sleep 15
+          done
+          echo "ok: dnf offers ventulusd $d and ventulus $g"
+
+      - name: Install the GUI, which pulls in the daemon
+        run: |
+          set -euo pipefail
+          dnf -y install ventulus
+          key=$(echo "$SIGNING_KEY" | tr 'A-F' 'a-f')
+          rpm -q gpg-pubkey --qf '%{version} %{summary}\n' | tee /tmp/keys.txt
+          grep -q "^${key} \|^${key: -8} " /tmp/keys.txt \
+            || { echo "::error::dnf did not import the repository key $SIGNING_KEY"; exit 1; }
+          for p in ventulus ventulusd; do
+            rpm -q "$p"
+            sig=$(rpm -q --qf '%{OPENPGP:pgpsig}' "$p")
+            case "$sig" in
+              *"Key ID ${key: -16}"*) echo "ok: $p signed: $sig" ;;
+              *) echo "::error::$p is not signed by $SIGNING_KEY: $sig"; exit 1 ;;
+            esac
+            from=$(dnf -q repoquery --installed --qf '%{from_repo}\n' "$p")
+            [ "$from" = ventulus ] || { echo "::error::$p came from '$from', not [ventulus]"; exit 1; }
+          done
+          ventulusd --version
+
+  # The manifest the GUI's update check reads (README § Update manifest): its
+  # signature against the key the GUI ships (this checkout's keys/ventulus.gpg),
+  # and its contents against the Releases themselves.
+  manifest:
+    name: Update manifest is signed and current
+    needs: upstream
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      WANT_D: ${{ needs.upstream.outputs.ventulusd }}
+      WANT_G: ${{ needs.upstream.outputs.ventulus }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: The signature verifies and the versions are current
+        run: |
+          set -euo pipefail
+          gpg --dearmor < keys/ventulus.gpg > /tmp/keyring.gpg
+          deadline=$((SECONDS + SETTLE_SECONDS))
+          while :; do
+            why=''
+            curl -fsS -o /tmp/m.json "$PAGES_URL/ventulus-updates.json" \
+              && curl -fsS -o /tmp/m.json.sig "$PAGES_URL/ventulus-updates.json.sig" \
+              || why='the manifest or its signature is not served'
+            if [ -z "$why" ]; then
+              status=$(gpgv --status-fd 1 --keyring /tmp/keyring.gpg /tmp/m.json.sig /tmp/m.json 2>/dev/null || true)
+              signer=$(awk '$2 == "VALIDSIG" {print $NF}' <<< "$status")
+              if [ "$signer" != "$SIGNING_KEY" ]; then
+                why="the signature does not verify as $SIGNING_KEY"
+              else
+                d=$(jq -r '.components.ventulusd.version' /tmp/m.json)
+                g=$(jq -r '.components.ventulus.version' /tmp/m.json)
+                [ "$d" = "$WANT_D" ] && [ "$g" = "$WANT_G" ] && break
+                why="it announces ventulusd ${d} and ventulus ${g}; the latest Releases are ${WANT_D} and ${WANT_G}"
+              fi
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::after ${SETTLE_SECONDS}s, ${why}"
+              exit 1
+            fi
+            echo "waiting: $why"
+            sleep 15
+          done
+          echo "ok: the manifest verifies and announces ventulusd $d and ventulus $g"
+
+      - name: Its contents match the Releases
+        run: |
+          set -euo pipefail
+          jq -e '.schema == 1' /tmp/m.json > /dev/null || { echo "::error::schema is not 1"; exit 1; }
+          fail=0
+          for p in ventulusd ventulus; do
+            tag=$(jq -r ".components.${p}.tag" /tmp/m.json)
+            mkdir -p "/tmp/$p"
+            gh release download "$tag" --repo "Plan-B-Development/$p" --pattern SHA256SUMS --dir "/tmp/$p" --clobber
+            # name + sha256 of every asset, as the manifest lists them and as the
+            # Release's SHA256SUMS does: exactly the same set.
+            jq -r ".components.${p}.assets[] | \"\(.sha256)  \(.name)\"" /tmp/m.json | sort > "/tmp/$p/manifest.txt"
+            sort "/tmp/$p/SHA256SUMS" > "/tmp/$p/release.txt"
+            if ! diff -u "/tmp/$p/release.txt" "/tmp/$p/manifest.txt"; then
+              echo "::error::$p: the manifest's assets differ from the Release's SHA256SUMS"
+              fail=1
+            fi
+            jq -r ".components.${p}.assets[] | \"\(.name) \(.url)\"" /tmp/m.json \
+              | while read -r name url; do
+                  [ "$url" = "https://github.com/Plan-B-Development/$p/releases/download/$tag/$name" ] \
+                    || { echo "::error::$p: $name has the URL $url"; exit 1; }
+                done || fail=1
+          done
+          min=$(jq -r '.components.ventulus.daemon_minimum' /tmp/m.json)
+          [ "$(printf '%s\n%s\n' "$min" "$WANT_D" | sort -V | head -1)" = "$min" ] \
+            || { echo "::error::the GUI needs ventulusd >= $min, but the latest daemon is $WANT_D"; fail=1; }
+          jq -e '.components.ventulusd.api_version | type == "number" and . >= 1' /tmp/m.json > /dev/null \
+            || { echo "::error::api_version is missing or not a positive number"; fail=1; }
+          [ "$fail" -eq 0 ] && echo "ok: every asset, daemon_minimum $min and api_version match"
+          exit "$fail"
+
   verify:
     name: Clean-machine install ([${{ matrix.section }}])
     runs-on: ubuntu-latest
@@ -344,14 +624,25 @@ jobs:
           expect_refusal 'Manjaro, launched from fish' 'Manjaro is not supported.' \
             fish -c 'bash ./bootstrap.sh'
 
+          # Debian, Ubuntu (and what is built on them) and Fedora are pointed at
+          # their own repositories (DEC-499).
           os 'NAME="Debian GNU/Linux"' 'ID=debian' 'PRETTY_NAME="Debian GNU/Linux 13 (trixie)"'
-          expect_refusal Debian 'Debian GNU/Linux 13 (trixie) is not supported.' bash ./bootstrap.sh
+          expect_refusal Debian 'On Debian GNU/Linux 13 (trixie), use the APT repository.' bash ./bootstrap.sh
 
           os 'NAME=Ubuntu' 'ID=ubuntu' 'ID_LIKE=debian' 'PRETTY_NAME="Ubuntu 26.04 LTS"'
-          expect_refusal Ubuntu 'Ubuntu 26.04 LTS is not supported.' bash ./bootstrap.sh
+          expect_refusal Ubuntu 'On Ubuntu 26.04 LTS, use the APT repository.' bash ./bootstrap.sh
 
-          os 'NAME="Fedora Linux"' 'ID=fedora' 'PRETTY_NAME="Fedora Linux 43 (Workstation Edition)"'
-          expect_refusal Fedora 'Fedora Linux 43 (Workstation Edition) is not supported.' bash ./bootstrap.sh
+          os 'NAME="Linux Mint"' 'ID=linuxmint' 'ID_LIKE="ubuntu debian"' 'PRETTY_NAME="Linux Mint 22.2"'
+          expect_refusal 'Linux Mint' 'On Linux Mint 22.2, use the APT repository.' bash ./bootstrap.sh
+          grep -qF 'Linux Mint 22' /tmp/out.txt \
+            || { echo "::error::the APT refusal does not name the unsupported Ubuntu 24.04 derivatives"; exit 1; }
+
+          os 'NAME="Fedora Linux"' 'ID=fedora' 'PRETTY_NAME="Fedora Linux 44 (Workstation Edition)"'
+          expect_refusal Fedora 'On Fedora Linux 44 (Workstation Edition), use the DNF repository.' bash ./bootstrap.sh
+
+          # ID_LIKE=fedora is not Fedora: the DNF repository cannot serve RHEL's family.
+          os 'NAME="AlmaLinux"' 'ID="almalinux"' 'ID_LIKE="rhel centos fedora"' 'PRETTY_NAME="AlmaLinux 10.0 (Purple Lion)"'
+          expect_refusal AlmaLinux 'AlmaLinux 10.0 (Purple Lion) is not supported.' bash ./bootstrap.sh
 
           # Arch from here on, each with one machine property wrong.
           printf '#!/bin/sh\necho aarch64\n' > /usr/local/bin/uname
@@ -388,6 +679,13 @@ jobs:
       # cached package) is a deliberate, commented choice.
       - name: shellcheck bootstrap.sh
         run: shellcheck --severity=warning bootstrap.sh
+
+      # publish.yml's own steps: a script that does not parse fails only at the
+      # next release, with the repositories half-published.
+      - name: shellcheck and compile the publish scripts
+        run: |
+          shellcheck --severity=warning -x .github/scripts/*.sh
+          python3 -m py_compile .github/scripts/manifest.py
 
       - name: Every README command block parses in every shell
         run: |

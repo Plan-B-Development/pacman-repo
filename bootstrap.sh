@@ -21,7 +21,8 @@
 #
 # CHECKS THE MACHINE FIRST. Step 0 prints what it detected — distribution,
 # architecture, init system, pacman — and stops, having changed nothing, on a
-# machine the packages cannot work on: a distribution not built on Arch, Manjaro,
+# machine the packages cannot work on: a distribution not built on Arch (Debian,
+# Ubuntu and Fedora are pointed at their APT and DNF repositories), Manjaro,
 # a CPU other than x86_64, a system not booted with systemd, or one missing
 # pacman (or sudo, when not run as root). A refusal exits
 # with status 3, so a caller can tell it from a step that failed (status 1).
@@ -121,12 +122,27 @@ case "$family" in
             "version the GUI cannot start." ;;
     *" arch "*|*" cachyos "*|*" endeavouros "*|*" garuda "*)
         ;;
+    *" debian "*|*" ubuntu "*)
+        refuse "bootstrap.sh is for Arch Linux. On $os_name, use the APT repository." \
+            "Debian 13 and Ubuntu 26.04 LTS install Ventulus from its signed APT" \
+            "repository; the steps are at" \
+            "https://github.com/Plan-B-Development/pacman-repo#debian-and-ubuntu" \
+            "Older releases are not supported: Debian 12, and Ubuntu 24.04 with the" \
+            "distributions built on it (Linux Mint 22, Pop!_OS 24.04), lack PySide6" \
+            "or a recent enough numpy or pyqtgraph." ;;
     *)
+        # Fedora by ID only: RHEL, AlmaLinux and Rocky carry ID_LIKE=fedora but
+        # lack the packages the GUI needs.
+        if [ "$os_id" = fedora ]; then
+            refuse "bootstrap.sh is for Arch Linux. On $os_name, use the DNF repository." \
+                "Fedora 44 installs Ventulus from its signed DNF repository; the steps" \
+                "are at https://github.com/Plan-B-Development/pacman-repo#fedora"
+        fi
         refuse "$os_name is not supported." \
-            "Ventulus is packaged only for Arch Linux and the distributions built" \
-            "on it, such as CachyOS, EndeavourOS and Garuda. There are no .deb or" \
-            ".rpm packages. The source is at" \
-            "https://github.com/Plan-B-Development/ventulusd and" \
+            "Ventulus is packaged for Arch Linux and the distributions built on it" \
+            "(such as CachyOS, EndeavourOS and Garuda), Debian 13, Ubuntu 26.04 LTS" \
+            "and Fedora 44: https://github.com/Plan-B-Development/pacman-repo" \
+            "The source is at https://github.com/Plan-B-Development/ventulusd and" \
             "https://github.com/Plan-B-Development/ventulus; building it yourself" \
             "on another distribution is possible but unsupported." ;;
 esac

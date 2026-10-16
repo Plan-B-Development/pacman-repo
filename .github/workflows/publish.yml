@@ -1,9 +1,14 @@
-name: Publish pacman repository
+name: Publish package repositories
 
-# Assembles the signed [ventulus] pacman repository and publishes it as the
-# assets of one rolling GitHub Release (tag `repo`).
+# Assembles every Ventulus package repository from the latest Release of each
+# source project, and the signed update manifest (DEC-241, DEC-499):
 #
-# Two databases, one set of packages. `ventulus.db` is the repository; the
+#   pacman  [ventulus]  assets of the rolling `repo` release (tag `repo`)
+#   APT     flat repo   assets of the same release (Debian 13, Ubuntu 26.04)
+#   DNF     per Fedora  GitHub Pages, rpm/fedora/<N>/x86_64/
+#   ventulus-updates.json + .sig      GitHub Pages, read by the GUI's update check
+#
+# Two pacman databases, one set of packages. `ventulus.db` is the repository; the
 # `control-ofc.db` beside it lists the same packages under the project's old
 # name, so a pacman.conf that still says [control-ofc] keeps upgrading, and the
 # `replaces=` in the ventulus packages carries those installs across on their
@@ -11,25 +16,34 @@ name: Publish pacman repository
 # database is the only way to serve both. When the transition window closes,
 # drop `control-ofc` from REPO_NAMES and the next run prunes its files.
 #
-# The job is DECLARATIVE, not incremental: every run rebuilds the whole database
-# from the current latest release of each source project. There is no state
-# carried between runs, so the job is idempotent, has no retention logic to get
-# wrong, and cannot end up advertising a package it did not upload. Re-running it
-# is always safe.
+# The run is DECLARATIVE, not incremental: every run rebuilds everything from
+# the current latest release of each source project. There is no state carried
+# between runs, so the run is idempotent, has no retention logic to get wrong,
+# and cannot end up advertising a package it did not upload. Re-running it is
+# always safe.
 #
 # Signing happens here rather than in the source repos so the GPG private key
 # lives in exactly one repository's secrets (DEC-241). The signature attests
 # "this repository published these bytes", which is ordinary repo semantics.
 #
 # What it does NOT attest by itself is that the bytes came from a legitimate
-# build — so every downloaded package's Sigstore build provenance is verified
-# before the signing key is imported (DEC-242). Signing is downstream of
-# verification, never a substitute for it.
+# build — so the `fetch` job verifies every asset's Sigstore build provenance
+# and its exact asset set before any job that holds the key starts (DEC-242).
+# Signing is downstream of verification, never a substitute for it.
+#
+# Job order is the publication order:
+#   fetch (no key) -> pacman, apt, dnf, manifest (sign; build artifacts only)
+#   -> release (pacman + APT onto the `repo` release; no key)
+#   -> pages (DNF + manifest, one atomic deployment)
+# Pages deploys only after the release assets are live, so the manifest never
+# announces a version that pacman or APT does not serve yet.
 #
 # Why `repo-add --sign` is NOT used: it shells out to gpg without loopback
 # pinentry, so a passphrase-protected key cannot be used non-interactively. The
 # database is built unsigned and then signed explicitly below, which is the same
-# result with control over how the passphrase is supplied.
+# result with control over how the passphrase is supplied. The APT, DNF and
+# manifest jobs hand the passphrase to gpg-agent once instead
+# (.github/scripts/lib.sh), because rpmsign runs gpg itself.
 
 on:
   workflow_dispatch:
@@ -39,7 +53,7 @@ on:
     types: [package-released]
 
 permissions:
-  contents: write
+  contents: read
 
 # A simultaneous GUI + daemon release must serialise. Two concurrent runs would
 # race on the release assets and one package could silently vanish from the DB.
@@ -53,88 +67,80 @@ env:
   # the key, and the list must match SECTIONS and the matrix in verify.yml
   # (its `fingerprint` job checks this).
   REPO_NAMES: ventulus control-ofc
-  PROJECTS: ventulusd ventulus
   REPO_TAG: repo
   SIGNING_KEY: 4AAD6D2DE40D0D10773BF770BC27C5EB2831FCDA
 
 jobs:
-  publish:
-    name: Assemble and publish
+  # Holds no key. Everything after it consumes only what it proved.
+  fetch:
+    name: Download and verify the Releases
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The GPG signatures applied downstream are the ENTIRE trust basis of
+      # `SigLevel = Required`, apt's `Signed-By` and dnf's gpgcheck: each
+      # installs whatever this workflow signs, silently, on every upgrade.
+      # Signing an asset we never authenticated would launder a substituted or
+      # compromised upload into a trusted package on every user's machine — the
+      # source-repo release is downloaded over the API, but "it was attached to a
+      # release" is not provenance.
+      #
+      # fetch.sh checks the asset set is exactly what release.yml publishes, that
+      # it matches the Release's SHA256SUMS, and runs `gh attestation verify` on
+      # every asset, pinned to the source repo's release.yml (--signer-workflow),
+      # the Release's own tag (--source-ref) and a GitHub-hosted runner, so an
+      # attestation from another workflow, a fork or another tag cannot satisfy
+      # it. It also reads the daemon's API_VERSION at that tag for the manifest.
+      - name: Download, check and verify provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/fetch.sh verified
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verified
+          path: verified/
+          if-no-files-found: error
+          retention-days: 3
+
+  pacman:
+    name: Build the pacman repository
+    needs: fetch
     runs-on: ubuntu-latest
     container: archlinux:latest
     steps:
       - name: Install tooling
-        run: pacman -Syu --noconfirm --needed pacman-contrib github-cli git
+        run: pacman -Syu --noconfirm --needed pacman-contrib
 
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # The job runs as root inside the Arch container while the checkout is
-      # owned by the runner uid, so git refuses the directory as "dubious
-      # ownership". `gh release` shells out to git to infer the repository, so
-      # without this every publish step fails after the packages are already
-      # built and signed.
-      - name: Mark the workspace safe for git
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verified
+          path: verified
 
-      # Public repos, so the ambient GITHUB_TOKEN is enough to read their
-      # releases — no cross-repo PAT needed on this side.
-      - name: Download the newest package from each project
-        env:
-          GH_TOKEN: ${{ github.token }}
+      # Exactly the bytes fetch verified, and exactly one package per project.
+      - name: Take the verified packages
         run: |
           set -euo pipefail
+          (cd verified && sha256sum --strict --quiet -c verified.sha256)
           mkdir -p build
-          for project in $PROJECTS; do
-            echo "::group::$project"
-            gh release download \
-              --repo "Plan-B-Development/$project" \
-              --pattern '*.pkg.tar.zst' \
-              --dir build
-            echo "::endgroup::"
-          done
-          # A -debug- package is build scaffolding, never something to serve.
-          rm -f build/*-debug-*.pkg.tar.zst
-          count=$(ls -1 build/*.pkg.tar.zst 2>/dev/null | wc -l)
-          if [ "$count" -ne 2 ]; then
-            echo "::error::expected exactly 2 packages (daemon + gui), got ${count}"
-            ls -l build/ || true
-            exit 1
-          fi
-          ls -l build/
-
-      # The GPG signature applied below is the ENTIRE trust basis of
-      # `SigLevel = Required`: pacman installs whatever this job signs, silently,
-      # on every `pacman -Syu`. Signing an asset we never authenticated would
-      # launder a substituted or compromised upload into a trusted package on
-      # every user's machine — the source-repo release is downloaded over the
-      # API, but "it was attached to a release" is not provenance.
-      #
-      # `gh attestation verify` checks the keyless Sigstore build provenance that
-      # each source repo's release.yml attaches (DEC-239). --signer-workflow pins
-      # WHICH workflow may have produced it, so an attestation from some other
-      # workflow in the same repo — or from a fork — cannot satisfy the check.
-      #
-      # Deliberately fail-closed and placed BEFORE the key import: an unverifiable
-      # package must stop the run while the private key is still untouched.
-      - name: Verify build provenance before signing anything
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          for project in $PROJECTS; do
+          for project in ventulusd ventulus; do
             # `ventulus-[0-9]*` cannot match `ventulusd-…`: the version starts with a digit.
-            mapfile -t pkgs < <(ls -1 "build/${project}"-[0-9]*.pkg.tar.zst)
+            mapfile -t pkgs < <(ls -1 "verified/${project}/${project}"-[0-9]*.pkg.tar.zst)
             if [ "${#pkgs[@]}" -ne 1 ]; then
               echo "::error::expected exactly 1 ${project} package, got ${#pkgs[@]}"
               exit 1
             fi
-            echo "::group::verify ${pkgs[0]}"
-            gh attestation verify "${pkgs[0]}" \
-              --repo "Plan-B-Development/${project}" \
-              --signer-workflow "Plan-B-Development/${project}/.github/workflows/release.yml"
-            echo "::endgroup::"
+            cp "${pkgs[0]}" build/
           done
+          ls -l build/
 
       - name: Import the signing key
         env:
@@ -226,9 +232,141 @@ jobs:
           done
           ls -l
 
-      - name: Publish the repository
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pacman
+          path: build/
+          if-no-files-found: error
+          retention-days: 3
+
+  apt:
+    name: Build the APT repository
+    needs: fetch
+    runs-on: ubuntu-latest
+    container: debian:13
+    steps:
+      - name: Install tooling
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends apt-utils gnupg gpg-agent gpgv xz-utils ca-certificates
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verified
+          path: verified
+
+      - name: Build and sign the flat repository
         env:
-          GH_TOKEN: ${{ github.token }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          (cd verified && sha256sum --strict --quiet -c verified.sha256)
+          bash .github/scripts/apt-repo.sh verified apt
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: apt
+          path: apt/
+          if-no-files-found: error
+          retention-days: 3
+
+  dnf:
+    name: Build the DNF repositories
+    needs: fetch
+    runs-on: ubuntu-latest
+    container: fedora:44
+    steps:
+      - name: Install tooling
+        run: dnf -y -q install rpm-sign createrepo_c gnupg2
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verified
+          path: verified
+
+      - name: Sign the packages, build and sign the metadata
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          (cd verified && sha256sum --strict --quiet -c verified.sha256)
+          bash .github/scripts/dnf-repo.sh verified site
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dnf
+          path: site/
+          if-no-files-found: error
+          retention-days: 3
+
+  manifest:
+    name: Build the update manifest
+    needs: fetch
+    runs-on: ubuntu-latest
+    container: debian:13
+    steps:
+      - name: Install tooling
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends gnupg gpg-agent gpgv python3 rpm zstd ca-certificates
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verified
+          path: verified
+
+      - name: Write and sign ventulus-updates.json
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          (cd verified && sha256sum --strict --quiet -c verified.sha256)
+          bash .github/scripts/manifest.sh verified manifest
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: manifest
+          path: manifest/
+          if-no-files-found: error
+          retention-days: 3
+
+  # pacman and APT share the `repo` release. Holds no key: everything it uploads
+  # was signed and checked by the jobs above.
+  release:
+    name: Publish pacman + APT on the repo release
+    needs: [pacman, apt, dnf, manifest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pacman
+          path: build
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: apt
+          path: build
+
+      - name: Publish the repository
         run: |
           set -euo pipefail
           keys=()
@@ -237,13 +375,14 @@ jobs:
             keys+=("${REPO_NAME}.gpg")
           done
           cd build
+          ls -l
 
           if ! gh release view "$REPO_TAG" >/dev/null 2>&1; then
             gh release create "$REPO_TAG" \
               --target "${GITHUB_SHA}" \
-              --title "Ventulus pacman repository" \
+              --title "Ventulus package repositories" \
               --notes "Rolling repository assets. Do not delete this release — \
-          it is the pacman \`Server\` endpoint. Regenerated by the publish workflow."
+          it is the pacman \`Server\` and the APT \`URIs\` endpoint. Regenerated by the publish workflow."
           fi
 
           # PUBLICATION ORDER IS LOAD-BEARING (DEC-248).
@@ -257,36 +396,50 @@ jobs:
           # verify.yml failed on `failed retrieving file 'control-ofc.db.sig' ...
           # 404` against a perfectly healthy repository on 2026-08-05.
           #
-          # The database is the POINTER. Nothing may reference a package that is
+          # The indices are the POINTERS. Nothing may reference a package that is
           # not already uploaded, so:
           #   1. packages + signatures first  (referenced-by, must exist first)
-          #   2. database staged under temp names, then swapped in by RENAME
+          #   2. indices staged under temp names, then swapped in by RENAME
           #   3. prune superseded assets last (nothing points at them any more)
           #
           # Package filenames carry the version, so a new release adds new asset
           # names rather than replacing any — the old packages stay downloadable
           # for the whole publish and are only removed by the prune at the end,
-          # once the new database has already stopped referencing them.
+          # once the new indices have already stopped referencing them.
+          #
+          # GitHub serves a REPLACED asset stale for about 90–150 s per URL once
+          # that URL has been fetched (DEC-499 phase 0), which no order here can
+          # avoid: in that window apt can pair a new InRelease with an old
+          # Packages (a hash mismatch; apt keeps its previous lists and the next
+          # `apt update` succeeds), and an old index can name a package the prune
+          # removed. The user accepted that window; README documents it and
+          # verify.yml waits it out.
           gh release upload "$REPO_TAG" --clobber \
-            ./*.pkg.tar.zst ./*.pkg.tar.zst.sig \
+            ./*.pkg.tar.zst ./*.pkg.tar.zst.sig ./*.deb \
             "${keys[@]}" bootstrap.sh bootstrap.sh.sig
 
-          # Stage the databases under names pacman never requests, so each live
-          # `<name>.db` keeps serving the OLD (still-valid, still-complete)
-          # database for the entire upload.
-          staging_files=()
+          # The indices, in swap order: each pacman database before its
+          # signature, and APT's InRelease last, after the Packages files and
+          # Release it vouches for.
+          indices=()
           for REPO_NAME in $REPO_NAMES; do
-            for f in "${REPO_NAME}.db" "${REPO_NAME}.db.sig" \
-                     "${REPO_NAME}.files" "${REPO_NAME}.files.sig"; do
-              cp "$f" "$f.staging"
-              staging_files+=("$f.staging")
-            done
+            indices+=("${REPO_NAME}.db" "${REPO_NAME}.db.sig" "${REPO_NAME}.files" "${REPO_NAME}.files.sig")
+          done
+          indices+=(Packages Packages.xz Release Release.gpg InRelease)
+
+          # Stage the indices under names no client requests, so each live index
+          # keeps serving the OLD (still-valid, still-complete) one for the
+          # entire upload.
+          staging_files=()
+          for f in "${indices[@]}"; do
+            cp "$f" "$f.staging"
+            staging_files+=("$f.staging")
           done
           gh release upload "$REPO_TAG" --clobber "${staging_files[@]}"
 
           # Swap by RENAME. Renaming a release asset is a metadata-only API call,
-          # so the interval where a database file is absent shrinks from "however
-          # long a multi-megabyte upload takes" to a few sequential PATCHes.
+          # so the interval where an index is absent shrinks from "however long a
+          # multi-megabyte upload takes" to a few sequential PATCHes.
           #
           # Honest limit: this is EFFECTIVELY atomic, not atomic. GitHub offers no
           # transaction across assets, so a `pacman -Sy` landing inside that
@@ -318,19 +471,16 @@ jobs:
             gh api --method PATCH "$staged_api" -f name="$final" >/dev/null
             echo "swapped in: $final"
           }
-          for REPO_NAME in $REPO_NAMES; do
-            swap "${REPO_NAME}.db"
-            swap "${REPO_NAME}.db.sig"
-            swap "${REPO_NAME}.files"
-            swap "${REPO_NAME}.files.sig"
+          for f in "${indices[@]}"; do
+            swap "$f"
           done
 
-          # Retitle a release created under the old name; a no-op once it matches.
-          gh release edit "$REPO_TAG" --title "Ventulus pacman repository" >/dev/null
+          # Retitle a release created under an older name; a no-op once it matches.
+          gh release edit "$REPO_TAG" --title "Ventulus package repositories" >/dev/null
 
           # Prune superseded assets, LAST — by this point the freshly-swapped
-          # database no longer references any of them, so removing them cannot
-          # break an in-flight `pacman -Syu` that already read the new database.
+          # indices no longer reference any of them, so removing them cannot
+          # break an in-flight upgrade that already read the new indices.
           # Without this every past version accumulates on the release forever:
           # inert, but unbounded, and it reads as though several versions are on
           # offer.
@@ -339,16 +489,56 @@ jobs:
           # normal path they no longer exist (they were renamed), but a run that
           # died mid-swap leaves one behind — excluding them here makes the next
           # successful publish self-healing.
-          ls -1 | grep -v '\.staging$' > /tmp/keep.txt
+          find . -maxdepth 1 -type f ! -name '*.staging' -printf '%f\n' > "$RUNNER_TEMP/keep.txt"
           gh release view "$REPO_TAG" --json assets -q '.assets[].name' \
             | while read -r asset; do
-                if ! grep -qxF "$asset" /tmp/keep.txt; then
+                if ! grep -qxF "$asset" "$RUNNER_TEMP/keep.txt"; then
                   echo "pruning superseded asset: $asset"
                   gh release delete-asset "$REPO_TAG" "$asset" --yes
                 fi
               done
 
-          echo "### Published" >> "$GITHUB_STEP_SUMMARY"
-          for pkg in *.pkg.tar.zst; do
-            echo "- \`$pkg\`" >> "$GITHUB_STEP_SUMMARY"
-          done
+          {
+            echo "### Published on the repo release"
+            for pkg in *.pkg.tar.zst *.deb; do
+              echo "- \`$pkg\`"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # One deployment replaces the whole site, so the DNF metadata, its packages
+  # and the manifest with its signature change together. Needs Pages enabled
+  # with "GitHub Actions" as the source.
+  pages:
+    name: Publish DNF + the update manifest on Pages
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dnf
+          path: site
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: manifest
+          path: site
+
+      - name: List the site
+        run: |
+          find site -type f | sort
+          {
+            echo "### Published on Pages"
+            find site -name '*.rpm' -printf '- `%P`\n' | sort
+            echo "- \`ventulus-updates.json\` (+ \`.sig\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
