@@ -8,7 +8,7 @@ daemon (`ventulusd`):
 | --- | --- | --- |
 | Arch Linux, CachyOS, EndeavourOS, Garuda | pacman `[ventulus]` | `sudo pacman -Syu` |
 | Debian 13, Ubuntu 26.04 LTS | APT | `sudo apt upgrade` |
-| Fedora 44 | DNF | `sudo dnf upgrade` |
+| Fedora 44, Fedora 45 | DNF | `sudo dnf upgrade` |
 
 Set one up once and both packages upgrade with the rest of your system.
 
@@ -210,9 +210,12 @@ packages installed under `/etc`, edited or not.
 
 ## Fedora
 
-Fedora 44. The repository is built per Fedora release, so a newer release is
-served only once a build for it is published; until then `dnf` fails to
-download the repository's metadata.
+Fedora 44 and 45. The repository is built per Fedora release, so a newer
+release is served only once a build for it is published. Until then `dnf` skips
+the repository with a warning and leaves Ventulus as it is. A `ventulus.repo`
+without the line `skip_if_unavailable=True` (fetched before Fedora 45 was
+added) stops every `dnf` command instead; fetch it again with the first command
+below.
 
 ```bash
 curl -fsSL https://plan-b-development.github.io/pacman-repo/ventulus.repo \
@@ -285,14 +288,14 @@ sudo apt install ./ventulusd_*_amd64.deb ./ventulus_*_all.deb
 ```
 
 ```bash
-# Fedora 44
+# Fedora 44 and 45: the GUI .rpm built for this Fedora release
 gh release download --repo Plan-B-Development/ventulusd --pattern '*.rpm'
-gh release download --repo Plan-B-Development/ventulus  --pattern '*.rpm'
-sudo dnf install ./ventulusd-*.x86_64.rpm ./ventulus-*.fc44.noarch.rpm
+gh release download --repo Plan-B-Development/ventulus  --pattern "*.fc$(rpm -E %fedora).noarch.rpm"
+sudo dnf install ./ventulusd-*.x86_64.rpm ./ventulus-*.noarch.rpm
 ```
 
 The tarballs (`ventulusd-X.Y.Z-x86_64.tar.gz`, `ventulus-X.Y.Z-noarch.tar.gz`)
-install on Debian 13, Ubuntu 26.04 and Fedora 44 without a package manager; the
+install on Debian 13, Ubuntu 26.04 and Fedora 44 and 45 without a package manager; the
 GUI's [Getting Started](https://github.com/Plan-B-Development/ventulus/blob/main/manual/getting-started.md#the-tarball)
 has the steps, and the GUI's update check can download and verify a new one.
 
@@ -352,7 +355,7 @@ Pages is deployed after the release, so the manifest never announces a version
 pacman and APT do not serve yet.
 
 `verify.yml` then installs from the published result in clean Arch, Debian 13,
-Ubuntu 26.04 and Fedora 44 containers using the commands above, checks the
+Ubuntu 26.04, Fedora 44 and Fedora 45 containers using the commands above, checks the
 manifest's signature and contents against the Releases, checks that
 `bootstrap.sh` refuses the machines it should, and parses every command on this
 page in bash, zsh and fish. It runs daily on a schedule — because these

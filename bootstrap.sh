@@ -135,13 +135,13 @@ case "$family" in
         # lack the packages the GUI needs.
         if [ "$os_id" = fedora ]; then
             refuse "bootstrap.sh is for Arch Linux. On $os_name, use the DNF repository." \
-                "Fedora 44 installs Ventulus from its signed DNF repository; the steps" \
+                "Fedora 44 and 45 install Ventulus from its signed DNF repository; the steps" \
                 "are at https://github.com/Plan-B-Development/pacman-repo#fedora"
         fi
         refuse "$os_name is not supported." \
             "Ventulus is packaged for Arch Linux and the distributions built on it" \
             "(such as CachyOS, EndeavourOS and Garuda), Debian 13, Ubuntu 26.04 LTS" \
-            "and Fedora 44: https://github.com/Plan-B-Development/pacman-repo" \
+            "and Fedora 44 and 45: https://github.com/Plan-B-Development/pacman-repo" \
             "The source is at https://github.com/Plan-B-Development/ventulusd and" \
             "https://github.com/Plan-B-Development/ventulus; building it yourself" \
             "on another distribution is possible but unsupported." ;;

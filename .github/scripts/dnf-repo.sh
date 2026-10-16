@@ -58,6 +58,10 @@ forget_signing_key
 # (new bytes, same name), so metadata older than the deployment can point at a
 # file that is gone or changed. dnf5 keeps metadata 48 h by default; 6 h bounds
 # that window (README § Fedora, and `dnf upgrade --refresh` skips it).
+# skip_if_unavailable: a Fedora release with no build here (one newer than the
+# last Release, or rawhide) gets a 404 for its $releasever directory; dnf5 then
+# skips this repository with a warning instead of failing every command. A
+# metadata or package signature failure is still a refusal.
 cat > "$site/ventulus.repo" <<EOF
 [ventulus]
 name=Ventulus
@@ -67,5 +71,6 @@ gpgcheck=1
 repo_gpgcheck=1
 gpgkey=$KEY_URL
 metadata_expire=6h
+skip_if_unavailable=True
 EOF
 find "$site" -type f | sort

@@ -2,7 +2,7 @@ name: Verify install path
 
 # Proves the published repositories actually work, from a clean machine, using
 # exactly the commands README.md gives users: pacman on Arch (and bootstrap.sh),
-# APT on Debian 13 and Ubuntu 26.04, DNF on Fedora 44, and the signed update
+# APT on Debian 13 and Ubuntu 26.04, DNF on Fedora 44 and 45, and the signed update
 # manifest. Nothing else in this project tests the thing users actually do — a
 # broken database, an unsigned package, a symlinked .db, or an untrusted key all
 # produce a perfectly green publish run and a repository nobody can install from.
@@ -165,7 +165,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: ['fedora:44']
+        image: ['fedora:44', 'fedora:45']
     env:
       WANT_D: ${{ needs.upstream.outputs.ventulusd }}
       WANT_G: ${{ needs.upstream.outputs.ventulus }}
@@ -181,6 +181,9 @@ jobs:
             grep -qxF "$line" /etc/yum.repos.d/ventulus.repo \
               || { echo "::error::the served ventulus.repo lacks '$line'"; exit 1; }
           done
+          # README promises that a Fedora release with no build here leaves dnf working.
+          grep -qxF skip_if_unavailable=True /etc/yum.repos.d/ventulus.repo \
+            || { echo "::error::the served ventulus.repo lacks 'skip_if_unavailable=True'"; exit 1; }
 
       # The metadata signature, checked directly against the published key, not
       # only through dnf's repo_gpgcheck.
