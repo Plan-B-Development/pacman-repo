@@ -160,7 +160,8 @@ jobs:
           (cd verified && sha256sum --strict --quiet -c verified.sha256)
           mkdir -p build
           for project in ventulusd ventulus; do
-            # `ventulus-[0-9]*` cannot match `ventulusd-…`: the version starts with a digit.
+            # `ventulus-[0-9]*` cannot match `ventulusd-…` or `ventulus-diag-…`:
+            # the version starts with a digit.
             mapfile -t pkgs < <(ls -1 "verified/${project}/${project}"-[0-9]*.pkg.tar.zst)
             if [ "${#pkgs[@]}" -ne 1 ]; then
               echo "::error::expected exactly 1 ${project} package, got ${#pkgs[@]}"
@@ -168,6 +169,12 @@ jobs:
             fi
             cp "${pkgs[0]}" build/
           done
+          # DEC-503: ventulus-diag, which the GUI of a split release depends on.
+          # fetch.sh proved there is one beside the GUI package, or none.
+          shopt -s nullglob
+          cli=(verified/ventulus/ventulus-diag-[0-9]*.pkg.tar.zst)
+          [ "${#cli[@]}" -le 1 ] || { echo "::error::more than one ventulus-diag package"; exit 1; }
+          [ "${#cli[@]}" -eq 0 ] || cp "${cli[0]}" build/
           ls -l build/
 
       - name: Import the signing key

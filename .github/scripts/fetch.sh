@@ -47,7 +47,7 @@ check_release() {
     # Exactly the packages release.yml builds, all of this version. GitHub stores
     # '~' in an asset name as '.', so a name the indices would point at could not
     # be fetched; the version regex below already excludes it.
-    local pkg deb rpm tar rpm_min=1 rpm_max=1
+    local pkg deb rpm tar rpm_min=1 rpm_max=1 cli_pkg='^$' cli_deb='^$' cli_rpm='^$'
     case $project in
         ventulusd)
             pkg="^ventulusd-$vre-[0-9]+-x86_64\.pkg\.tar\.zst$"
@@ -60,14 +60,25 @@ check_release() {
             # One build per Fedora release (python(abi) differs), so one or more.
             rpm="^ventulus-$vre-[0-9]+\.fc[0-9]+\.noarch\.rpm$"
             rpm_max=99
-            tar="^ventulus-$vre-noarch\.tar\.gz$" ;;
+            tar="^ventulus-$vre-noarch\.tar\.gz$"
+            # DEC-503: from the release that split it, ventulus-diag beside each
+            # package but the tarball, which carries both. All or none (below).
+            cli_pkg="^ventulus-diag-$vre-[0-9]+-any\.pkg\.tar\.zst$"
+            cli_deb="^ventulus-diag_$vre-[0-9]+_all\.deb$"
+            cli_rpm="^ventulus-diag-$vre-[0-9]+\.fc[0-9]+\.noarch\.rpm$" ;;
         *) die "unknown project $project" ;;
     esac
-    local n_pkg=0 n_deb=0 n_rpm=0 n_tar=0
+    local n_pkg=0 n_deb=0 n_rpm=0 n_tar=0 n_cli_pkg=0 n_cli_deb=0
+    local -a gui_fc=() cli_fc=()
     for name in "${listed[@]}"; do
-        if   [[ $name =~ $pkg ]]; then n_pkg=$((n_pkg + 1))
+        if   [[ $name =~ $cli_pkg ]]; then n_cli_pkg=$((n_cli_pkg + 1))
+        elif [[ $name =~ $cli_deb ]]; then n_cli_deb=$((n_cli_deb + 1))
+        elif [[ $name =~ $cli_rpm ]]; then cli_fc+=("$(sed 's/.*\.\(fc[0-9]*\)\.noarch\.rpm$/\1/' <<< "$name")")
+        elif [[ $name =~ $pkg ]]; then n_pkg=$((n_pkg + 1))
         elif [[ $name =~ $deb ]]; then n_deb=$((n_deb + 1))
-        elif [[ $name =~ $rpm ]]; then n_rpm=$((n_rpm + 1))
+        elif [[ $name =~ $rpm ]]; then
+            n_rpm=$((n_rpm + 1))
+            [ "$project" != ventulus ] || gui_fc+=("$(sed 's/.*\.\(fc[0-9]*\)\.noarch\.rpm$/\1/' <<< "$name")")
         elif [[ $name =~ $tar ]]; then n_tar=$((n_tar + 1))
         else die "$project $v: unexpected asset $name"
         fi
@@ -84,8 +95,19 @@ check_release() {
     if [ "$project" = ventulus ]; then
         # Two builds for one Fedora release would be two candidates in one repo.
         local dup
-        dup=$(printf '%s\n' "${listed[@]}" | sed -n 's/.*\.\(fc[0-9]*\)\.noarch\.rpm$/\1/p' | sort | uniq -d)
+        dup=$(printf '%s\n' "${gui_fc[@]}" | sort | uniq -d)
         [ -z "$dup" ] || die "$project $v: more than one .rpm for $dup"
+        dup=$(printf '%s\n' "${cli_fc[@]}" | sort | uniq -d)
+        [ -z "$dup" ] || die "$project $v: more than one ventulus-diag .rpm for $dup"
+        # ventulus-diag: none (a release before the split), or one beside every
+        # GUI package: the GUI of a split release depends on it.
+        if [ $((n_cli_pkg + n_cli_deb + ${#cli_fc[@]})) -gt 0 ]; then
+            [ "$n_cli_pkg" -eq 1 ] || die "$project $v: expected 1 ventulus-diag .pkg.tar.zst, found $n_cli_pkg"
+            [ "$n_cli_deb" -eq 1 ] || die "$project $v: expected 1 ventulus-diag .deb, found $n_cli_deb"
+            [ "$(printf '%s\n' "${cli_fc[@]}" | sort)" = "$(printf '%s\n' "${gui_fc[@]}" | sort)" ] \
+                || die "$project $v: the ventulus-diag .rpms (${cli_fc[*]}) are not for the GUI's Fedora releases (${gui_fc[*]})"
+            echo "ok: $project $v carries ventulus-diag beside each package"
+        fi
     fi
     echo "ok: $project $v has exactly the expected assets, matching SHA256SUMS"
 }

@@ -17,7 +17,11 @@ out=${2:?usage: apt-repo.sh <verified-dir> <out-dir>}
 mkdir -p "$out"
 
 mapfile -t debs < <(find "$src" -name '*.deb' | sort)
-[ "${#debs[@]}" -eq 2 ] || { echo "::error::expected 2 .debs (daemon + gui), found ${#debs[@]}"; exit 1; }
+# The daemon and the GUI, and from the release that split it ventulus-diag
+# (DEC-503), which fetch.sh proved is there exactly when the GUI needs it.
+want=2
+[ -z "$(find "$src" -name 'ventulus-diag_*.deb')" ] || want=3
+[ "${#debs[@]}" -eq "$want" ] || { echo "::error::expected $want .debs (daemon, gui${want/3/, ventulus-diag}), found ${#debs[@]}"; exit 1; }
 cp "${debs[@]}" "$out/"
 cd "$out"
 
@@ -45,7 +49,7 @@ grep '^Filename: ' Packages | cut -d' ' -f2 | while read -r f; do
     [ -f "$f" ] || { echo "::error::Packages names $f, which is not in the repository"; exit 1; }
     case $f in */*|*'~'*) echo "::error::$f cannot be a release asset name"; exit 1 ;; esac
 done
-[ "$(grep -c '^Package: ' Packages)" -eq 2 ] || { echo "::error::Packages does not list exactly 2 packages"; exit 1; }
+[ "$(grep -c '^Package: ' Packages)" -eq "$want" ] || { echo "::error::Packages does not list exactly $want packages"; exit 1; }
 verify_published InRelease
 verify_published Release.gpg Release
 ls -l

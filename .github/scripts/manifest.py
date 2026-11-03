@@ -15,7 +15,10 @@ served beside its detached signature by the repository key. Format 1:
 
 Each asset is {"name", "format", "sha256", "size", "url"} (+ "fedora" for an
 .rpm), describing the file attached to the source Release, as its SHA256SUMS
-lists it. `format` is one of pacman, deb, rpm, tarball.
+lists it. `format` is one of pacman, deb, rpm, tarball. The GUI's
+ventulus-diag packages (DEC-503) are left out: the update check takes the one
+asset per format of a component, and an installed GUI that found two would
+offer none. They always come with the GUI of the same version.
 
 `daemon_minimum` is the GUI's ventulusd floor, read from the GUI's own
 packages; the Arch, Debian and every Fedora package must agree on it, or no
@@ -66,10 +69,16 @@ def asset_format(name: str) -> str:
     raise AssertionError  # unreachable
 
 
+#: Release assets that are not the component's own package (DEC-503).
+NOT_ANNOUNCED = re.compile(r"^ventulus-diag[-_]")
+
+
 def assets(project: str, tag: str, folder: Path) -> list[dict]:
     out = []
     for line in (folder / "SHA256SUMS").read_text().splitlines():
         digest, name = line.split("  ", 1)
+        if NOT_ANNOUNCED.match(name):
+            continue
         entry = {
             "name": name,
             "format": asset_format(name),
@@ -91,16 +100,22 @@ def one_floor(source: str, constraints: list[str]) -> str:
     return constraints[0]
 
 
+def own(paths) -> list[Path]:
+    """The GUI's own packages among *paths*: not ventulus-diag's (DEC-503)."""
+    return sorted(p for p in paths if not NOT_ANNOUNCED.match(p.name))
+
+
 def daemon_minimum(folder: Path) -> str:
+    """The floor the GUI's own packages declare; ventulus-diag's are not read."""
     floors = {}
-    for pkg in folder.glob("*.pkg.tar.zst"):
+    for pkg in own(folder.glob("*.pkg.tar.zst")):
         info = run("tar", "--zstd", "-xOf", str(pkg), ".PKGINFO")
         floors[pkg.name] = one_floor(pkg.name, re.findall(r"^depend = ventulusd(?:>=(\S+)|\s*$)", info, re.M))
-    for deb in folder.glob("*.deb"):
+    for deb in own(folder.glob("*.deb")):
         depends = run("dpkg-deb", "-f", str(deb), "Depends")
         found = [m.group(1) or "" for m in re.finditer(r"(?:^|,)\s*ventulusd\b(?:\s*\(>=\s*([^)\s]+)\))?", depends)]
         floors[deb.name] = one_floor(deb.name, found)
-    for rpm in folder.glob("*.rpm"):
+    for rpm in own(folder.glob("*.rpm")):
         requires = run("rpm", "-qp", "--requires", str(rpm))
         floors[rpm.name] = one_floor(rpm.name, re.findall(r"^ventulusd(?:\s*>=\s*(\S+)|\s*$)", requires, re.M))
     if len(floors) < 3:

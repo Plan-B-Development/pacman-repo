@@ -2,8 +2,10 @@
 # dnf-repo.sh <verified-dir> <site-dir>
 #   Build the signed DNF repositories for GitHub Pages from the verified .rpms:
 #     <site-dir>/rpm/fedora/<N>/x86_64/   one per Fedora release N with a GUI
-#                                         build (ventulus-…fcN.noarch.rpm); the
-#                                         daemon .rpm, built once, is in each
+#                                         build (ventulus-…fcN.noarch.rpm, and
+#                                         from the split ventulus-diag-…fcN,
+#                                         DEC-503); the daemon .rpm, built once,
+#                                         is in each
 #     <site-dir>/ventulus.repo            baseurl …/rpm/fedora/$releasever/$basearch/
 #   Every .rpm is signed (rpmsign) and every repodata/repomd.xml carries a
 #   detached armored signature (repomd.xml.asc) for repo_gpgcheck.
@@ -23,13 +25,15 @@ PAGES_URL=${PAGES_URL:-https://plan-b-development.github.io/pacman-repo}
 KEY_URL=${KEY_URL:-https://raw.githubusercontent.com/Plan-B-Development/pacman-repo/main/keys/ventulus.gpg}
 
 mapfile -t daemon < <(find "$src" -name 'ventulusd-*.x86_64.rpm')
-mapfile -t gui < <(find "$src" -name 'ventulus-*.fc*.noarch.rpm' | sort)
+# `ventulus-[0-9]*` cannot match `ventulus-diag-…`: the version starts with a digit.
+mapfile -t gui < <(find "$src" -name 'ventulus-[0-9]*.fc*.noarch.rpm' | sort)
+mapfile -t cli < <(find "$src" -name 'ventulus-diag-[0-9]*.fc*.noarch.rpm' | sort)
 [ "${#daemon[@]}" -eq 1 ] || { echo "::error::expected 1 daemon .rpm, found ${#daemon[@]}"; exit 1; }
 [ "${#gui[@]}" -ge 1 ] || { echo "::error::no GUI .rpm"; exit 1; }
 
 import_signing_key
 work=$(mktemp -d)
-cp "${daemon[0]}" "${gui[@]}" "$work/"
+cp "${daemon[0]}" "${gui[@]}" "${cli[@]}" "$work/"
 rpmsign --define "_openpgp_sign_id $SIGNING_KEY" --addsign "$work"/*.rpm
 
 # Check each signed .rpm against the published key alone, in a scratch rpmdb.
@@ -44,9 +48,17 @@ daemon_signed="$work/$(basename "${daemon[0]}")"
 for g in "${gui[@]}"; do
     name=$(basename "$g")
     [[ $name =~ \.fc([0-9]+)\.noarch\.rpm$ ]] || { echo "::error::no Fedora release in $name"; exit 1; }
-    dir="$site/rpm/fedora/${BASH_REMATCH[1]}/x86_64"
+    fc=${BASH_REMATCH[1]}
+    dir="$site/rpm/fedora/$fc/x86_64"
     mkdir -p "$dir"
     cp "$daemon_signed" "$work/$name" "$dir/"
+    # ventulus-diag for this release, which the GUI beside it depends on.
+    if [ "${#cli[@]}" -gt 0 ]; then
+        diag=("$work"/ventulus-diag-[0-9]*".fc$fc.noarch.rpm")
+        [ -f "${diag[0]}" ] && [ "${#diag[@]}" -eq 1 ] \
+            || { echo "::error::expected one ventulus-diag .rpm for Fedora $fc, found ${diag[*]}"; exit 1; }
+        cp "${diag[0]}" "$dir/"
+    fi
     createrepo_c --quiet --general-compress-type=zstd "$dir"
     sign --detach-sign --armor -o "$dir/repodata/repomd.xml.asc" "$dir/repodata/repomd.xml"
     verify_published "$dir/repodata/repomd.xml.asc" "$dir/repodata/repomd.xml"

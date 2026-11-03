@@ -154,6 +154,15 @@ jobs:
             grep -q ' installed$' /tmp/q || { echo "::error::$p is not installed"; exit 1; }
           done
           ventulusd --version
+          # DEC-503: from the release that split it, the GUI depends on the
+          # ventulus-diag of its own version, which must come along with it.
+          if dpkg-query -W -f '${Depends}' ventulus | grep -q 'ventulus-diag'; then
+            want="$(dpkg-query -W -f '${Version}' ventulus) installed"
+            got=$(dpkg-query -W -f '${Version} ${db:Status-Status}' ventulus-diag)
+            [ "$got" = "$want" ] \
+              || { echo "::error::ventulus-diag is '$got', not '$want' beside ventulus"; exit 1; }
+            ventulus-diag --version
+          fi
 
   # README § Fedora, in a clean container of each Fedora release served. Add a
   # release here when the GUI Release gains its .fcN.rpm.
@@ -249,7 +258,18 @@ jobs:
           rpm -q gpg-pubkey --qf '%{version} %{summary}\n' | tee /tmp/keys.txt
           grep -q "^${key} \|^${key: -8} " /tmp/keys.txt \
             || { echo "::error::dnf did not import the repository key $SIGNING_KEY"; exit 1; }
-          for p in ventulus ventulusd; do
+          pkgs=(ventulus ventulusd)
+          # DEC-503: from the release that split it, the GUI requires the
+          # ventulus-diag of its own build, which must come along, signed.
+          if rpm -q --requires ventulus | grep -q '^ventulus-diag '; then
+            pkgs+=(ventulus-diag)
+            want=$(rpm -q --qf '%{VERSION}-%{RELEASE}' ventulus)
+            got=$(rpm -q --qf '%{VERSION}-%{RELEASE}' ventulus-diag) \
+              || { echo "::error::ventulus-diag is not installed"; exit 1; }
+            [ "$got" = "$want" ] \
+              || { echo "::error::ventulus-diag is $got, not $want beside ventulus"; exit 1; }
+          fi
+          for p in "${pkgs[@]}"; do
             rpm -q "$p"
             sig=$(rpm -q --qf '%{OPENPGP:pgpsig}' "$p")
             case "$sig" in
@@ -318,7 +338,8 @@ jobs:
             # name + sha256 of every asset, as the manifest lists them and as the
             # Release's SHA256SUMS does: exactly the same set.
             jq -r ".components.${p}.assets[] | \"\(.sha256)  \(.name)\"" /tmp/m.json | sort > "/tmp/$p/manifest.txt"
-            sort "/tmp/$p/SHA256SUMS" > "/tmp/$p/release.txt"
+            # The ventulus-diag packages are not announced (manifest.py, DEC-503).
+            grep -vE '  ventulus-diag[-_]' "/tmp/$p/SHA256SUMS" | sort > "/tmp/$p/release.txt" || true
             if ! diff -u "/tmp/$p/release.txt" "/tmp/$p/manifest.txt"; then
               echo "::error::$p: the manifest's assets differ from the Release's SHA256SUMS"
               fail=1
@@ -446,6 +467,14 @@ jobs:
           pacman -S --print --noconfirm ventulus | tee /tmp/plan.txt
           grep -q 'ventulusd' /tmp/plan.txt \
             || { echo "::error::ventulus did not pull in ventulusd"; exit 1; }
+          # DEC-503: from the release that split it, the GUI depends on the
+          # ventulus-diag of its own version, which must be in the plan.
+          info=$(pacman -Si "${SECTION}/ventulus")
+          if grep -E '^Depends On' <<< "$info" | grep -q 'ventulus-diag'; then
+            v=$(awk '/^Version/ {print $3}' <<< "$info")
+            grep -q "/ventulus-diag-${v}-any\.pkg\.tar\.zst$" /tmp/plan.txt \
+              || { echo "::error::ventulus did not pull in ventulus-diag $v"; exit 1; }
+          fi
 
       # Staleness alarm. Everything above passes just as happily against a
       # repository frozen ten versions ago — an install that works is not an

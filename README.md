@@ -115,8 +115,10 @@ sudo pacman -Syu ventulus
 sudo systemctl enable --now ventulusd
 ```
 
-`ventulusd` is pulled in automatically as a dependency of the GUI. If you only
-want the daemon (headless), `sudo pacman -Syu ventulusd`.
+`ventulusd` is pulled in automatically as a dependency of the GUI, and so is
+`ventulus-diag`, the diagnostic CLI. If you only want the daemon (headless),
+`sudo pacman -Syu ventulusd`; add `ventulus-diag` for the diagnostic tests, which
+needs no desktop.
 
 Do not skip `systemctl enable --now` — the GUI talks to the daemon over a Unix
 socket and opens to a "disconnected" screen without it.
@@ -291,7 +293,7 @@ sudo pacman -U ./ventulusd-*.pkg.tar.zst ./ventulus-*-any.pkg.tar.zst
 # Debian 13, Ubuntu 26.04
 gh release download --repo Plan-B-Development/ventulusd --pattern '*.deb'
 gh release download --repo Plan-B-Development/ventulus  --pattern '*.deb'
-sudo apt install ./ventulusd_*_amd64.deb ./ventulus_*_all.deb
+sudo apt install ./ventulusd_*_amd64.deb ./ventulus_*_all.deb ./ventulus-diag_*_all.deb
 ```
 
 ```bash
