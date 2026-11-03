@@ -305,7 +305,7 @@ sudo dnf install ./ventulusd-*.x86_64.rpm ./ventulus-*.noarch.rpm
 
 The tarballs (`ventulusd-X.Y.Z-x86_64.tar.gz`, `ventulus-X.Y.Z-noarch.tar.gz`)
 install on Debian 13, Ubuntu 26.04 and Fedora 44 and 45 without a package manager; the
-GUI's [Getting Started](https://github.com/Plan-B-Development/ventulus/blob/main/manual/getting-started.md#the-tarball)
+GUI manual's [Installing § The tarball](https://github.com/Plan-B-Development/ventulus/blob/main/manual/admin/install.md#the-tarball)
 has the steps, and the GUI's update check can download and verify a new one.
 
 Upgrading a release install means repeating those commands. That is the trade
