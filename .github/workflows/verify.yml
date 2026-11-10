@@ -744,6 +744,31 @@ jobs:
   # compared them, so a key rotation would have to be caught by hand in all five
   # — and a miss means either a fail-closed install (the lucky case) or a stale
   # fingerprint quietly trusted somewhere.
+  #
+  # KEY ROTATION CHECKLIST. The key is pinned outside this repo too: the GUI
+  # (Plan-B-Development/ventulus) ships the public key as package data and pins
+  # its fingerprint for the update check. Extending the old key's expiry does not
+  # reach installed GUIs — their key file keeps the self-signature they shipped
+  # with — so a GUI release has to come first, well before the old key expires:
+  #   1. Generate the successor key.
+  #   2. GUI release: add the successor's public key to
+  #      src/ventulus/data/ventulus-repository-key.asc (beside the old one) and its
+  #      fingerprint to REPOSITORY_KEY_FINGERPRINTS in
+  #      src/ventulus/services/signature.py. A GUI without it stops verifying when
+  #      the manifest switches signer (step 4), so ship it a release cycle or more
+  #      before that. GUI 6.0.0 and earlier lose the update check at the switch
+  #      whatever is done: they accept only a single signature by the old key.
+  #   3. Until the switch, sign ventulus-updates.json with the old key alone:
+  #      every GUI accepts that. One .sig carrying signatures by both keys is
+  #      accepted by every GUI after 6.0.0 that pins either key while that key
+  #      has not expired (an expired key's signature does not count), but GUI
+  #      6.0.0 and earlier refuse any file with two signatures. Dual-sign only for
+  #      an overlap in which some supported GUI pins the successor alone, and then
+  #      teach the `manifest` job's signer check to accept a VALIDSIG by either key.
+  #   4. Here: switch keys/ventulus.gpg (and keys/control-ofc.gpg), the five pins
+  #      below, the manifest and the pacman/APT/DNF signing to the successor, and
+  #      tell users how to trust it, before the old key expires.
+  #   5. A later GUI release drops the old key from its key file and pin.
   fingerprint:
     name: Signing key is consistent and not near expiry
     runs-on: ubuntu-latest
@@ -833,13 +858,17 @@ jobs:
             echo "::error::places, and republish."
             exit 1
           elif [ "$days" -le 90 ]; then
-            echo "::error::The signing key expires in $days day(s). Rotate it NOW:"
-            echo "::error::generate the new key, update keys/ventulus.gpg (and its copy keys/control-ofc.gpg), re-pin the"
-            echo "::error::fingerprint in bootstrap.sh, publish.yml, verify.yml and"
-            echo "::error::README.md, then republish so users pick it up before expiry."
+            echo "::error::The signing key expires in $days day(s). Rotate it NOW, following the"
+            echo "::error::KEY ROTATION CHECKLIST above the fingerprint job in verify.yml: a GUI release"
+            echo "::error::carrying the successor key (ventulus src/ventulus/services/signature.py and"
+            echo "::error::src/ventulus/data/ventulus-repository-key.asc) first, then keys/ventulus.gpg"
+            echo "::error::(and its copy keys/control-ofc.gpg), the fingerprint in bootstrap.sh,"
+            echo "::error::publish.yml, verify.yml and README.md, then republish before expiry."
             exit 1
           elif [ "$days" -le 180 ]; then
-            echo "::warning::The signing key expires in $days day(s). Plan the rotation."
+            echo "::warning::The signing key expires in $days day(s). Plan the rotation: the GUI"
+            echo "::warning::release carrying the successor key must already be out (see the"
+            echo "::warning::KEY ROTATION CHECKLIST above the fingerprint job)."
           fi
 
           echo "ok: $days day(s) of validity remaining"
